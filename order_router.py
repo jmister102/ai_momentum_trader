@@ -109,6 +109,10 @@ async def submit_orders(
     session = "swing" if swing else "intraday"
     child_tif = "GTC" if swing else "DAY"  # GTC so swing protection survives overnight
 
+    # Outside-RTH flag: a limit/stop won't fill in pre/post market without it.
+    _t = now_et.timetz().replace(tzinfo=None)
+    outside_rth = _t < dtime(9, 30) or _t >= dtime(16, 0)
+
     # ── time cutoff ── only for intraday entries, which must exit same day.
     # Swing-eligible (after-noon) entries can enter right up to the close — that's
     # the whole point of not eliminating late-day entries.
@@ -140,7 +144,8 @@ async def submit_orders(
 
     # Parent buy — hold transmit until all children are attached.
     parent = LimitOrder("BUY", qty, round(entry, 2),
-                        orderId=ib.client.getReqId(), tif="DAY", transmit=False)
+                        orderId=ib.client.getReqId(), tif="DAY", transmit=False,
+                        outsideRth=outside_rth)
 
     children: List[Order] = []
 
@@ -148,7 +153,7 @@ async def submit_orders(
     tgt1 = LimitOrder("SELL", qty_t1, round(t1, 2),
                       orderId=ib.client.getReqId(), tif=child_tif,
                       parentId=parent.orderId, ocaGroup=oca_group, ocaType=1,
-                      transmit=False)
+                      transmit=False, outsideRth=outside_rth)
     children.append(tgt1)
 
     # Optional target 2 on the residual.
@@ -156,14 +161,14 @@ async def submit_orders(
         tgt2 = LimitOrder("SELL", qty_residual, round(float(t2), 2),
                           orderId=ib.client.getReqId(), tif=child_tif,
                           parentId=parent.orderId, ocaGroup=oca_group, ocaType=1,
-                          transmit=False)
+                          transmit=False, outsideRth=outside_rth)
         children.append(tgt2)
 
     # Stop on 100% of shares, OCA — transmit=True on the last child fires the batch.
     stp = StopOrder("SELL", qty, round(stop, 2),
                     orderId=ib.client.getReqId(), tif=child_tif,
                     parentId=parent.orderId, ocaGroup=oca_group, ocaType=1,
-                    transmit=True)
+                    transmit=True, outsideRth=outside_rth)
     children.append(stp)
 
     trades = [ib.placeOrder(contract, parent)]
@@ -245,14 +250,16 @@ def _arm_overnight_bracket(ib: IB, contract, qty: int,
     if qty <= 0 or not stop_price:
         return
     oca = f"ON_{contract.symbol}_{qty}"
+    # outsideRth so the overnight stop/target can also act in pre/post market.
     stp = StopOrder("SELL", qty, round(float(stop_price), 2),
                     orderId=ib.client.getReqId(), tif="GTC",
-                    ocaGroup=oca, ocaType=1, transmit=(target_price is None))
+                    ocaGroup=oca, ocaType=1, transmit=(target_price is None),
+                    outsideRth=True)
     ib.placeOrder(contract, stp)
     if target_price:
         tgt = LimitOrder("SELL", qty, round(float(target_price), 2),
                          orderId=ib.client.getReqId(), tif="GTC",
-                         ocaGroup=oca, ocaType=1, transmit=True)
+                         ocaGroup=oca, ocaType=1, transmit=True, outsideRth=True)
         ib.placeOrder(contract, tgt)
 
 

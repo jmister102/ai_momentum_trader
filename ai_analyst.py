@@ -17,7 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from typing import Any, Dict, Optional
 
 import pytz
@@ -38,6 +38,10 @@ Your job is to make a binary GO / NO-GO entry decision and, if GO, specify exact
 
 By the time this alert fires, the stock is already well above 2× its prior close —
 chasing it blindly is how you get trapped at the top. Be selective.
+
+You may trade in pre-market and post-market as well as regular hours. Extended-hours
+liquidity is thinner, so weigh spread/fill risk — but do not refuse a trade merely
+because the regular session is closed.
 
 HARD RULES YOU MUST FOLLOW (non-negotiable):
 - Trade size is fixed at $200 regardless of your confidence.
@@ -105,9 +109,13 @@ so weigh how much room is left vs. reversal risk before committing.
 
 ## Session Context
 - Trades taken today: {trades_today} / 2 max
-- Current ET time: {et_time}
+- Current ET time: {et_time}  ({clock_session})
+- Extended hours: pre-market (04:00–09:30) and post-market (16:00–20:00) entries
+  ARE allowed and orders are routed to fill outside regular hours. Liquidity and
+  spreads are thinner then — factor that into the setup, but it is NOT a reason
+  to auto-decline.
 - Entry session: {entry_session}
-- Time remaining until today's 15:55 ET close: {minutes_remaining} minutes
+- Exit timing: {forced_exit_desc}
 """
 
 
@@ -139,6 +147,40 @@ def is_swing_entry(now_et: datetime) -> bool:
 def _minutes_to_close(now_et: datetime) -> int:
     close = now_et.replace(hour=15, minute=55, second=0, microsecond=0)
     return max(0, int((close - now_et).total_seconds() // 60))
+
+
+def clock_session(now_et: datetime) -> str:
+    """The current trading session by ET clock (independent of the noon rule)."""
+    t = now_et.timetz().replace(tzinfo=None)
+    if dtime(4, 0) <= t < dtime(9, 30):
+        return "PRE-MARKET"
+    if dtime(9, 30) <= t < dtime(16, 0):
+        return "REGULAR HOURS"
+    if dtime(16, 0) <= t < dtime(20, 0):
+        return "POST-MARKET"
+    return "CLOSED"
+
+
+def _forced_exit_dt(now_et: datetime, swing: bool) -> datetime:
+    """When this entry must be flat. Intraday → today 15:55; swing → the next
+    trading day's 15:55 (the overnight backstop). Weekends roll to Monday."""
+    if not swing:
+        return now_et.replace(hour=15, minute=55, second=0, microsecond=0)
+    nxt = now_et + timedelta(days=1)
+    while nxt.weekday() >= 5:  # Sat=5, Sun=6
+        nxt += timedelta(days=1)
+    return nxt.replace(hour=15, minute=55, second=0, microsecond=0)
+
+
+def _forced_exit_desc(now_et: datetime, swing: bool) -> str:
+    deadline = _forced_exit_dt(now_et, swing)
+    hrs = max(0.0, (deadline - now_et).total_seconds() / 3600.0)
+    when = deadline.strftime("%a %H:%M ET")
+    if swing:
+        return (f"shares NOT carried are sold into the nearest regular close; "
+                f"carried shares (overnight_hold_pct) are held until {when} "
+                f"(~{hrs:.0f}h from now), the hard backstop")
+    return f"ALL shares flat by {when} (~{hrs:.0f}h from now)"
 
 
 def build_user_prompt(
@@ -182,10 +224,11 @@ def build_user_prompt(
         price_vs_entry=price_vs_entry,
         trades_today=trades_today,
         et_time=now_et.strftime("%H:%M:%S %Z"),
+        clock_session=clock_session(now_et),
         entry_session=("swing-eligible (after 12:00 ET — overnight_hold_pct may be 0-100)"
                        if is_swing_entry(now_et)
                        else "intraday (before 12:00 ET — overnight_hold_pct MUST be 0)"),
-        minutes_remaining=_minutes_to_close(now_et),
+        forced_exit_desc=_forced_exit_desc(now_et, is_swing_entry(now_et)),
     )
 
 

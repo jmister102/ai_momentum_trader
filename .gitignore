@@ -1,0 +1,16 @@
+# Secrets — real config never committed
+config.py
+
+# Trade + scanner logs
+fills.jsonl
+triggers.jsonl
+
+# Generated charts
+charts/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.log

@@ -1,0 +1,10 @@
+# AI Momentum Trader dependencies
+# Install on native Windows Python 3.10+ :  py -m pip install -r requirements.txt
+
+ib_insync==0.9.86      # IB Gateway scanner + orders
+anthropic>=0.39.0      # Claude Sonnet decision call
+polygon-api-client>=1.14.0  # historical OHLCV + snapshots + news
+matplotlib>=3.8.0      # chart PNG generation
+mplfinance>=0.12.10b0  # candlestick charts
+pytz>=2024.1           # ET session math
+requests>=2.31.0       # Polygon REST fallback

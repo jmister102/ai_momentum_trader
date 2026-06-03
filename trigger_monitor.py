@@ -101,6 +101,8 @@ def session_now(now: Optional[datetime] = None) -> str:
 
 # on_trigger may be sync or async; the monitor awaits coroutines.
 TriggerHandler = Callable[[Trigger], Optional[Awaitable[None]]]
+# on_scan reports each completed scan cycle (heartbeat + top movers) for the UI.
+ScanHandler = Callable[[dict], None]
 
 
 class TriggerMonitor:
@@ -108,6 +110,7 @@ class TriggerMonitor:
         self,
         ib: Optional[IB] = None,
         on_trigger: Optional[TriggerHandler] = None,
+        on_scan: Optional[ScanHandler] = None,
         trigger_pct: float = 1.00,       # +100%
         poll_interval: float = 30.0,
         scan_rows: int = 25,
@@ -121,11 +124,13 @@ class TriggerMonitor:
             ib = IB()
         self.ib = ib
         self.on_trigger = on_trigger
+        self.on_scan = on_scan
         self.trigger_pct = trigger_pct
         self.poll_interval = poll_interval
         self.scan_rows = scan_rows
         self.market_data_timeout = market_data_timeout
         self.log_path = log_path
+        self.last_poll: Optional[datetime] = None
 
         self.host = config.IB_HOST
         self.port = config.IB_PORT
@@ -187,9 +192,11 @@ class TriggerMonitor:
             rows = await asyncio.wait_for(self.ib.reqScannerDataAsync(sub), timeout=15.0)
         except asyncio.TimeoutError:
             logger.warning("scanner timeout (data farm may be down / wrong session)")
+            self._emit_scan([])   # heartbeat: still alive, just no rows this cycle
             return []
         except Exception as e:
             logger.warning("scanner error: %s", e)
+            self._emit_scan([])
             return []
 
         if diagnose:
@@ -197,6 +204,7 @@ class TriggerMonitor:
                   f"(session={session_now()}):")
 
         triggers: List[Trigger] = []
+        movers: List[dict] = []          # all quoted rows, for the dashboard
         for row in rows:
             try:
                 contract = row.contractDetails.contract
@@ -208,6 +216,10 @@ class TriggerMonitor:
 
             last, prior, vol = await self._quote(contract)
             pct = (last / prior - 1.0) if (last and prior) else None
+
+            if pct is not None:
+                movers.append({"rank": getattr(row, "rank", None), "symbol": symbol,
+                               "pct": round(pct, 4), "last": last, "prior": prior})
 
             if diagnose:
                 rk = getattr(row, "rank", None)
@@ -230,7 +242,25 @@ class TriggerMonitor:
             triggers.append(trig)
             await self._dispatch(trig)
 
+        self._emit_scan(movers)
         return triggers
+
+    def _emit_scan(self, movers: List[dict]) -> None:
+        """Heartbeat + top-5 movers to the on_scan handler (UI). Never fatal."""
+        self.last_poll = datetime.now(timezone.utc)
+        if not self.on_scan:
+            return
+        top5 = sorted(movers, key=lambda m: m["pct"], reverse=True)[:5]
+        try:
+            self.on_scan({
+                "ts": self.last_poll.astimezone(ET).isoformat(timespec="seconds"),
+                "session": session_now(),
+                "scanner": "IB",
+                "movers": top5,
+                "triggered_today": sorted(self.triggered_today),
+            })
+        except Exception:
+            logger.exception("on_scan handler failed")
 
     async def _quote(self, contract) -> tuple[Optional[float], Optional[float], Optional[float]]:
         """Live last, prior close, today's volume. Reuses streaming subscriptions."""

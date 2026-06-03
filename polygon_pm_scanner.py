@@ -77,17 +77,58 @@ def find_matches(tickers: List[dict]) -> List[Trigger]:
     return out
 
 
+def top_movers(tickers: List[dict], n: int = 5) -> List[dict]:
+    """Top-n % gainers from the snapshot, regardless of the 2× trigger — this is
+    the '% change list' shown on the dashboard during PM/AH."""
+    rows = []
+    for t in tickers:
+        day = t.get("day") or {}
+        prev = t.get("prevDay") or {}
+        last = day.get("c") or 0
+        prior = prev.get("c") or 0
+        if prior <= 0 or last <= 0:
+            continue
+        rows.append({"symbol": t.get("ticker", "?"), "pct": round(last / prior - 1.0, 4),
+                     "last": last, "prior": prior})
+    rows.sort(key=lambda r: r["pct"], reverse=True)
+    for i, r in enumerate(rows[:n], 1):
+        r["rank"] = i
+    return rows[:n]
+
+
+# on_scan reports each scan cycle (heartbeat + top movers) to the UI.
+ScanHandler = Callable[[dict], None]
+
+
 class PolygonPMScanner:
     def __init__(self, on_trigger: Optional[TriggerHandler] = None,
+                 on_scan: Optional[ScanHandler] = None,
                  poll_interval: float = 60.0):
         self.on_trigger = on_trigger
+        self.on_scan = on_scan
         self.poll_interval = poll_interval
         self.triggered_today: set[str] = set()
         self._day_key: Optional[str] = None
         self._stopping = False
+        self.last_poll: Optional[datetime] = None
 
     def stop(self) -> None:
         self._stopping = True
+
+    def _emit_scan(self, movers: List[dict]) -> None:
+        self.last_poll = datetime.now(timezone.utc)
+        if not self.on_scan:
+            return
+        try:
+            self.on_scan({
+                "ts": self.last_poll.astimezone().isoformat(timespec="seconds"),
+                "session": session_now(),
+                "scanner": "Polygon PM",
+                "movers": movers,
+                "triggered_today": sorted(self.triggered_today),
+            })
+        except Exception:
+            logger.exception("on_scan handler failed")
 
     def _roll_day(self) -> None:
         key = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
@@ -97,7 +138,9 @@ class PolygonPMScanner:
 
     async def scan_once(self, verbose: bool = False) -> List[Trigger]:
         self._roll_day()
-        matches = find_matches(fetch_snapshot())
+        snapshot = fetch_snapshot()
+        matches = find_matches(snapshot)
+        self._emit_scan(top_movers(snapshot))
         fired = []
         for trig in matches:
             if verbose:

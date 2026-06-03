@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from datetime import datetime, time as dtime, timedelta
 from typing import Any, Dict
@@ -29,6 +30,7 @@ import pytz
 
 import config
 import fill_logger
+import status as status_io
 from ai_analyst import call_ai
 from chart_builder import build_chart
 from enricher import enrich
@@ -187,11 +189,42 @@ def _print_trigger_block(trig: Trigger, enrichment: Dict[str, Any],
 
 
 class Trader:
-    def __init__(self, ib, dry_run: bool, allow_live: bool):
+    def __init__(self, ib, dry_run: bool, allow_live: bool, mode: str):
         self.ib = ib
         self.dry_run = dry_run
         self.allow_live = allow_live
+        self.mode = mode
         self._swept_date = None
+
+    def on_scan(self, summary: Dict[str, Any]) -> None:
+        """Scan-cycle heartbeat → status.json for the dashboard. Tags each top
+        mover with whether the IB account holds it and whether it's bot-owned."""
+        try:
+            account_long = {}
+            for p in self.ib.positions():
+                c = p.contract
+                if getattr(c, "secType", "STK") == "STK" and p.position != 0:
+                    account_long[c.symbol] = int(p.position)
+            bot_held = fill_logger.open_bot_positions()
+            for m in summary.get("movers", []):
+                sym = m.get("symbol")
+                m["held"] = sym in account_long
+                m["held_shares"] = account_long.get(sym)
+                m["bot"] = sym in bot_held
+            status_io.write_status({
+                "running": True,
+                "mode": self.mode,
+                "pid": os.getpid(),
+                "last_poll": summary.get("ts"),
+                "session": summary.get("session"),
+                "scanner": summary.get("scanner"),
+                "movers": summary.get("movers", []),
+                "held": [{"symbol": s, "shares": n, "bot": s in bot_held}
+                         for s, n in sorted(account_long.items())],
+                "triggered_today": summary.get("triggered_today", []),
+            })
+        except Exception:
+            logger.exception("on_scan/status write failed")
 
     async def run_pipeline(self, trig: Trigger) -> None:
         symbol = trig.symbol
@@ -243,9 +276,11 @@ async def main_async(args) -> int:
         ib.disconnect()
         return 1
 
-    trader = Trader(ib, dry_run=args.dry_run, allow_live=args.allow_live)
+    mode = "DRY-RUN" if args.dry_run else ("LIVE" if args.allow_live else "PAPER")
+    trader = Trader(ib, dry_run=args.dry_run, allow_live=args.allow_live, mode=mode)
 
-    monitor = TriggerMonitor(ib=None, on_trigger=trader.run_pipeline)
+    monitor = TriggerMonitor(ib=None, on_trigger=trader.run_pipeline,
+                             on_scan=trader.on_scan)
     # Scanner gets its own clientId/connection so it never contends with orders.
     await monitor.connect()
 
@@ -254,10 +289,9 @@ async def main_async(args) -> int:
         asyncio.create_task(trader.forced_exit_loop()),
     ]
     if not args.no_pm:
-        pm = PolygonPMScanner(on_trigger=trader.run_pipeline)
+        pm = PolygonPMScanner(on_trigger=trader.run_pipeline, on_scan=trader.on_scan)
         tasks.append(asyncio.create_task(pm.run()))
 
-    mode = "DRY-RUN" if args.dry_run else ("LIVE" if args.allow_live else "PAPER")
     print(f"\n{BAR}\n  AI Momentum Trader running — {mode} mode  (session: {session_now()})\n"
           f"  Ctrl-C to stop\n{BAR}\n", flush=True)
 
@@ -269,6 +303,11 @@ async def main_async(args) -> int:
         monitor.stop()
         for t in tasks:
             t.cancel()
+        # Flag the dashboard as stopped (best-effort, preserve the last snapshot).
+        last = status_io.read_status() or {}
+        last["running"] = False
+        last["mode"] = mode
+        status_io.write_status(last)
         await monitor.disconnect()
         if ib.isConnected():
             ib.disconnect()

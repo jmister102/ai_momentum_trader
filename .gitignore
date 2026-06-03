@@ -5,6 +5,10 @@ config.py
 fills.jsonl
 triggers.jsonl
 
+# Runtime dashboard heartbeat
+status.json
+status.json.tmp
+
 # Generated charts
 charts/
 

@@ -88,6 +88,23 @@ async def _connect_ib(max_wait_seconds: int = 600, retry_every: int = 15):
             await asyncio.sleep(retry_every)
 
 
+def _start_dashboard(host: str, port: int):
+    """Serve the status dashboard in a daemon thread. Best-effort: a bind
+    failure (e.g. port in use) logs a warning and trading continues unaffected."""
+    import threading
+    from http.server import ThreadingHTTPServer
+    import dashboard
+    try:
+        srv = ThreadingHTTPServer((host, port), dashboard.Handler)
+    except OSError as e:
+        logger.warning("dashboard not started on %s:%d (%s) — trading continues",
+                       host, port, e)
+        return None
+    threading.Thread(target=srv.serve_forever, daemon=True, name="dashboard").start()
+    logger.info("dashboard → http://%s:%d", host, port)
+    return srv
+
+
 def _account_guard(ib, allow_live: bool, dry_run: bool) -> bool:
     """
     Decide whether it's safe to start, given the connected account + flags.
@@ -279,6 +296,9 @@ async def main_async(args) -> int:
     mode = "DRY-RUN" if args.dry_run else ("LIVE" if args.allow_live else "PAPER")
     trader = Trader(ib, dry_run=args.dry_run, allow_live=args.allow_live, mode=mode)
 
+    dash = None if args.no_dashboard else _start_dashboard(args.dashboard_host,
+                                                           args.dashboard_port)
+
     monitor = TriggerMonitor(ib=None, on_trigger=trader.run_pipeline,
                              on_scan=trader.on_scan)
     # Scanner gets its own clientId/connection so it never contends with orders.
@@ -292,8 +312,10 @@ async def main_async(args) -> int:
         pm = PolygonPMScanner(on_trigger=trader.run_pipeline, on_scan=trader.on_scan)
         tasks.append(asyncio.create_task(pm.run()))
 
-    print(f"\n{BAR}\n  AI Momentum Trader running — {mode} mode  (session: {session_now()})\n"
-          f"  Ctrl-C to stop\n{BAR}\n", flush=True)
+    dash_line = (f"\n  Dashboard: http://{args.dashboard_host}:{args.dashboard_port}"
+                 if dash is not None else "")
+    print(f"\n{BAR}\n  AI Momentum Trader running — {mode} mode  (session: {session_now()})"
+          f"{dash_line}\n  Ctrl-C to stop\n{BAR}\n", flush=True)
 
     try:
         await asyncio.gather(*tasks)
@@ -308,6 +330,8 @@ async def main_async(args) -> int:
         last["running"] = False
         last["mode"] = mode
         status_io.write_status(last)
+        if dash is not None:
+            dash.shutdown()
         await monitor.disconnect()
         if ib.isConnected():
             ib.disconnect()
@@ -320,6 +344,10 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="run pipeline + AI but never place orders")
     ap.add_argument("--no-pm", action="store_true", help="disable PM/AH Polygon scanner")
+    ap.add_argument("--no-dashboard", action="store_true",
+                    help="don't serve the status dashboard")
+    ap.add_argument("--dashboard-host", default="127.0.0.1")
+    ap.add_argument("--dashboard-port", type=int, default=8787)
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)-7s %(name)s  %(message)s")

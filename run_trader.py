@@ -29,6 +29,7 @@ from typing import Any, Dict
 import pytz
 
 import config
+import decision_log
 import fill_logger
 import status as status_io
 from ai_analyst import call_ai
@@ -259,6 +260,16 @@ class Trader:
 
             trades_today = fill_logger.trades_today()
             decision = call_ai(enrichment, chart_path, trades_today)
+
+            # Persist EVERY decision (GO/NO-GO, dry-run included) for the nightly
+            # retrospective. Never let a logging failure break the pipeline.
+            try:
+                decision_log.log_decision(
+                    symbol, trig.timestamp.astimezone(ET).isoformat(timespec="seconds"),
+                    trig.session, enrichment.get("last_price"),
+                    enrichment.get("prior_close"), decision, self.mode)
+            except Exception:
+                logger.exception("decision_log failed for %s", symbol)
 
             order_rec = None
             if decision.get("decision") == "GO" and not self.dry_run:

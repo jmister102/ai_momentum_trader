@@ -18,6 +18,7 @@ import argparse
 import json
 import logging
 from datetime import datetime, time as dtime, timedelta
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import pytz
@@ -26,6 +27,17 @@ import config
 
 logger = logging.getLogger("ai_analyst")
 ET = pytz.timezone("America/New_York")
+PLAYBOOK_PATH = Path(__file__).parent / "playbook.md"
+
+
+def _load_playbook() -> str:
+    """Approved lessons (playbook.md) injected into each decision. The nightly
+    retrospective writes proposals to playbook_pending.md; only what you approve
+    into playbook.md is ever read here — pending lessons never auto-influence."""
+    try:
+        return PLAYBOOK_PATH.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return ""
 
 MAX_ENTRY_DISTANCE = 0.05   # entry_limit must be within ±5% of current price
 MIN_TARGET_MULT = 1.20      # target_1 ≥ entry × 1.20
@@ -205,7 +217,7 @@ def build_user_prompt(
     else:
         news_block = "- (no recent headlines found)"
 
-    return USER_PROMPT_TEMPLATE.format(
+    prompt = USER_PROMPT_TEMPLATE.format(
         symbol=e.get("symbol", "?"),
         last_price=_fmt(last, "price"),
         prior_close=_fmt(e.get("prior_close"), "price"),
@@ -230,6 +242,12 @@ def build_user_prompt(
                        else "intraday (before 12:00 ET — overnight_hold_pct MUST be 0)"),
         forced_exit_desc=_forced_exit_desc(now_et, is_swing_entry(now_et)),
     )
+
+    playbook = _load_playbook()
+    if playbook:
+        prompt += ("\n\n## Learned Playbook (approved lessons from past trades — "
+                   "weigh these; they reflect what has and hasn't worked)\n" + playbook)
+    return prompt
 
 
 def _no_go(reason: str, raw: Optional[str] = None) -> Dict[str, Any]:

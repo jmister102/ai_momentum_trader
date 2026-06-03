@@ -9,6 +9,13 @@ triggers.jsonl
 status.json
 status.json.tmp
 
+# Retrospective: decision log, generated reports, learned playbook
+# (playbook.md is curated knowledge — `git add -f playbook.md` if you want it versioned)
+decisions.jsonl
+reports/
+playbook.md
+playbook_pending.md
+
 # Generated charts
 charts/
 

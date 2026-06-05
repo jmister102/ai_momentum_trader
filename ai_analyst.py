@@ -39,9 +39,16 @@ def _load_playbook() -> str:
     except (FileNotFoundError, OSError):
         return ""
 
-MAX_ENTRY_DISTANCE = 0.05   # entry_limit must be within ±5% of current price
+ENTRY_MARKUP = 0.10         # entry_limit = current price × (1 + this). A marketable
+                            # limit ~10% ABOVE last so a fast-moving stock still
+                            # fills (a limit at/below market won't fill on a runner).
 MIN_TARGET_MULT = 1.20      # target_1 ≥ entry × 1.20
 MIN_STOP_MULT = 0.50        # stop ≥ entry × 0.50
+
+
+def entry_for(last_price: float) -> float:
+    """The marketable entry limit: ~10% above the current price."""
+    return round(last_price * (1 + ENTRY_MARKUP), 2)
 
 SYSTEM_PROMPT = """\
 You are an expert intraday trading analyst specializing in small-cap momentum stocks.
@@ -71,9 +78,10 @@ positions can be held overnight (see HOLDING WINDOW).
 
 HARD RULES YOU MUST FOLLOW (non-negotiable):
 - Trade size is fixed at $200 regardless of your confidence.
-- Entry: choose an entry_limit at or just below the CURRENT price so a limit BUY
-  fills promptly. It MUST be within 5% of the current price (no more than 5% above
-  and no more than 5% below "Current price"). Do NOT anchor to 2× prior close.
+- Entry: your entry_limit is FIXED at ~10% ABOVE the current price — a marketable
+  limit so a fast-moving stock still fills (a limit at or below market will NOT
+  fill on a runner). Use EXACTLY the "Entry limit to use" value given below as your
+  entry_limit, and set target_1 and stop relative to THAT value.
 - Limit sell targets must represent at least +20% gain from your entry_limit.
 - Stop loss must be no worse than -50% from your entry_limit (can be tighter).
 - HOLDING WINDOW (depends on entry time, given as "Entry session" below):
@@ -90,7 +98,7 @@ Schema:
 {
   "decision": "GO" | "NO-GO",
   "confidence": 0.0-1.0,
-  "entry_limit": <float, within 5% of the current price>,
+  "entry_limit": <float, = the "Entry limit to use" value (~10% above current)>,
   "target_1_price": <float, ≥ entry × 1.20>,
   "target_1_pct_shares": <int, 25-75>,
   "target_2_price": <float | null, > target_1 if present>,
@@ -108,10 +116,11 @@ USER_PROMPT_TEMPLATE = """\
 TRIGGER ALERT — {symbol}
 
 ## Market Context
-- Current price: ${last_price}   ← anchor your entry_limit within ±5% of THIS
+- Current price: ${last_price}
+- Entry limit to use: ${entry_to_use}  ← USE THIS as entry_limit (~10% above current; marketable, fills on a runner)
 - Prior close: ${prior_close}
 - Gain today: +{pct_gain_today}
-- 2× prior close: ${entry_limit}  (the trigger level — informational only, NOT the entry)
+- 2× prior close: ${entry_limit}  (the trigger level — informational only)
 - Volume today: {volume_today} shares
 - 20-day avg dollar volume (ADV): ${adv_20}
 - Today's volume vs ADV ratio: {vol_adv_ratio}
@@ -231,9 +240,12 @@ def build_user_prompt(
     else:
         news_block = "- (no recent headlines found)"
 
+    entry_to_use = _fmt(entry_for(last), "price") if last else "unknown"
+
     prompt = USER_PROMPT_TEMPLATE.format(
         symbol=e.get("symbol", "?"),
         last_price=_fmt(last, "price"),
+        entry_to_use=entry_to_use,
         prior_close=_fmt(e.get("prior_close"), "price"),
         pct_gain_today=_fmt(e.get("pct_gain_today"), "pct"),
         entry_limit=_fmt(entry, "price"),
@@ -284,18 +296,14 @@ def _validate(decision: Dict[str, Any], last_price: Optional[float],
     if not last_price:
         return _no_go("validation: current price unknown, cannot verify entry")
 
-    entry = decision.get("entry_limit")
+    # Entry is DETERMINISTIC: a marketable limit ~10% above the current price so
+    # the order fills on a runner (a limit at/below market won't fill). Override
+    # whatever the model returned — it was shown this exact value ("Entry limit to
+    # use") and told to set target_1/stop relative to it.
+    entry = entry_for(last_price)
+    decision["entry_limit"] = entry
     t1 = decision.get("target_1_price")
     stop = decision.get("stop_loss_price")
-
-    # Entry must sit within ±MAX_ENTRY_DISTANCE of the current price so the limit
-    # fills promptly and we don't chase far above market or rest far below it.
-    if entry is None or abs(entry - last_price) > last_price * MAX_ENTRY_DISTANCE + 1e-6:
-        lo = last_price * (1 - MAX_ENTRY_DISTANCE)
-        hi = last_price * (1 + MAX_ENTRY_DISTANCE)
-        return _no_go(f"validation: entry_limit {entry} outside ±{MAX_ENTRY_DISTANCE:.0%} "
-                      f"of current {last_price:.2f} (allowed {lo:.2f}–{hi:.2f})",
-                      raw=decision.get("_raw"))
     if t1 is None or t1 < entry * MIN_TARGET_MULT - 1e-6:
         return _no_go(f"validation: target_1 {t1} < entry×1.20 ({entry*MIN_TARGET_MULT:.2f})",
                       raw=decision.get("_raw"))

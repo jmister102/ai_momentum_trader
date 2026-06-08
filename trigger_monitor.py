@@ -351,6 +351,7 @@ async def _amain(args: argparse.Namespace) -> int:
     mon = TriggerMonitor(
         trigger_pct=args.trigger / 100.0,
         poll_interval=args.interval,
+        client_id=args.client_id,
     )
     try:
         if args.diagnose:
@@ -375,6 +376,8 @@ def main() -> int:
                    help="seconds between scans (default 30)")
     p.add_argument("--diagnose", action="store_true",
                    help="single scan: dump raw rows + gains, then exit")
+    p.add_argument("--client-id", type=int, default=None,
+                   help="IB clientId (use e.g. 12 to diagnose alongside a running bot)")
     args = p.parse_args()
     logging.basicConfig(
         level=logging.INFO,

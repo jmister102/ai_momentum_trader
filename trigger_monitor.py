@@ -242,6 +242,14 @@ class TriggerMonitor:
             triggers.append(trig)
             await self._dispatch(trig)
 
+        # Diagnostic: distinguish "scanner returned nothing" from "rows came back
+        # but no live quotes populated" (the latter = market-data issue, not the
+        # scanner). Only logged when the mover list is empty so it's not noisy.
+        if not movers:
+            logger.info("IB scan: %d scanner rows, 0 usable quotes (session=%s) — "
+                        "if rows>0 the scanner works but reqMktData isn't returning "
+                        "last/close (market-data subscription or competing TWS session)",
+                        len(rows), session_now())
         self._emit_scan(movers)
         return triggers
 

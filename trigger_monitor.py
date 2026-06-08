@@ -383,7 +383,10 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)-7s %(name)s  %(message)s",
     )
-    quiet_scanner_cancel_noise()
+    # In diagnose mode, show ALL scanner messages (incl. any real Error 162 like
+    # "max scanner subscriptions") instead of filtering the routine cancel noise.
+    if not args.diagnose:
+        quiet_scanner_cancel_noise()
     try:
         return asyncio.run(_amain(args))
     except KeyboardInterrupt:

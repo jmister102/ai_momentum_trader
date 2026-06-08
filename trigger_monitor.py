@@ -141,6 +141,8 @@ class TriggerMonitor:
         self._tickers: Dict[str, Ticker] = {}
         self._day_key: Optional[str] = None
         self._stopping = False
+        self._scan_sub = None        # persistent ScannerSubscription data list
+        self._empty_cycles = 0       # consecutive empty reads → re-subscribe
 
     # ── lifecycle ────────────────────────────────────────────────────────────
 
@@ -153,6 +155,7 @@ class TriggerMonitor:
         logger.info("connected — server v%s", self.ib.client.serverVersion())
 
     async def disconnect(self) -> None:
+        self._cancel_subscription()
         for ticker in list(self._tickers.values()):
             try:
                 self.ib.cancelMktData(ticker.contract)
@@ -161,6 +164,14 @@ class TriggerMonitor:
         self._tickers.clear()
         if self.ib.isConnected():
             self.ib.disconnect()
+
+    def _cancel_subscription(self) -> None:
+        if self._scan_sub is not None:
+            try:
+                self.ib.cancelScannerSubscription(self._scan_sub)
+            except Exception:
+                pass
+            self._scan_sub = None
 
     def stop(self) -> None:
         self._stopping = True
@@ -185,23 +196,44 @@ class TriggerMonitor:
             self.triggered_today.clear()
             logger.info("new ET day %s — debounce cleared", key)
 
-    async def scan_once(self, diagnose: bool = False) -> List[Trigger]:
-        self._roll_day()
-        sub = self._subscription()
-        try:
-            rows = await asyncio.wait_for(self.ib.reqScannerDataAsync(sub), timeout=15.0)
-        except asyncio.TimeoutError:
-            logger.warning("scanner timeout (data farm may be down / wrong session)")
-            self._emit_scan([])   # heartbeat: still alive, just no rows this cycle
-            return []
-        except Exception as e:
-            logger.warning("scanner error: %s", e)
-            self._emit_scan([])
-            return []
+    async def _current_rows(self, diagnose: bool = False) -> list:
+        """Read the latest rows from a PERSISTENT scanner subscription. Subscribes
+        once (waiting for the first batch), then returns the live-updated list each
+        cycle — no re-subscribing, which keeps the scanner farm warm and avoids the
+        repeated one-shot 162 churn that left the farm cold and timing out."""
+        if self._scan_sub is None:
+            try:
+                self._scan_sub = self.ib.reqScannerSubscription(self._subscription())
+            except Exception as e:
+                logger.warning("scanner subscribe failed: %s", e)
+                return []
+            loop = asyncio.get_event_loop()
+            deadline = loop.time() + 12.0
+            while loop.time() < deadline and not list(self._scan_sub):
+                await asyncio.sleep(0.25)
+
+        rows = list(self._scan_sub or [])
+        if not rows:
+            self._empty_cycles += 1
+            if self._empty_cycles >= 3:
+                logger.warning("scanner empty %d cycles — re-subscribing "
+                               "(farm may have dropped; restart Gateway if it persists)",
+                               self._empty_cycles)
+                self._cancel_subscription()
+                self._empty_cycles = 0
+        else:
+            self._empty_cycles = 0
 
         if diagnose:
-            print(f"\n  scanner returned {len(rows)} rows "
-                  f"(session={session_now()}):")
+            print(f"\n  scanner returned {len(rows)} rows (session={session_now()}):")
+        return rows
+
+    async def scan_once(self, diagnose: bool = False) -> List[Trigger]:
+        self._roll_day()
+        rows = await self._current_rows(diagnose=diagnose)
+        if not rows:
+            self._emit_scan([])   # heartbeat: still alive, just no rows this cycle
+            return []
 
         triggers: List[Trigger] = []
         movers: List[dict] = []          # all quoted rows, for the dashboard

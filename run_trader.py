@@ -216,27 +216,47 @@ class Trader:
 
     def on_scan(self, summary: Dict[str, Any]) -> None:
         """Scan-cycle heartbeat → status.json for the dashboard. Tags each top
-        mover with whether the IB account holds it and whether it's bot-owned."""
+        mover with whether the IB account holds it and whether it's bot-owned.
+
+        Two scanners write here: IB owns regular hours, Polygon PM owns pre/post-
+        market. A non-authoritative scanner (e.g. IB during pre-market, where it
+        can't scan and reports no movers) must NOT wipe the authoritative scanner's
+        movers — it only refreshes the heartbeat. Otherwise the dashboard flickers
+        empty every other cycle."""
         try:
+            session = summary.get("session")
+            scanner = summary.get("scanner")
+            movers = summary.get("movers", []) or []
+            is_pm = session in ("PREMARKET", "POSTMARKET")
+            authoritative = (scanner == "Polygon PM") if is_pm else (scanner == "IB")
+
             account_long = {}
             for p in self.ib.positions():
                 c = p.contract
                 if getattr(c, "secType", "STK") == "STK" and p.position != 0:
                     account_long[c.symbol] = int(p.position)
             bot_held = fill_logger.open_bot_positions()
-            for m in summary.get("movers", []):
-                sym = m.get("symbol")
-                m["held"] = sym in account_long
-                m["held_shares"] = account_long.get(sym)
-                m["bot"] = sym in bot_held
+
+            prev = status_io.read_status() or {}
+            if not authoritative and not movers:
+                # Keep the authoritative scanner's last movers + label; just beat.
+                movers = prev.get("movers", [])
+                scanner = prev.get("scanner", scanner)
+            else:
+                for m in movers:
+                    sym = m.get("symbol")
+                    m["held"] = sym in account_long
+                    m["held_shares"] = account_long.get(sym)
+                    m["bot"] = sym in bot_held
+
             status_io.write_status({
                 "running": True,
                 "mode": self.mode,
                 "pid": os.getpid(),
                 "last_poll": summary.get("ts"),
-                "session": summary.get("session"),
-                "scanner": summary.get("scanner"),
-                "movers": summary.get("movers", []),
+                "session": session,
+                "scanner": scanner,
+                "movers": movers,
                 "held": [{"symbol": s, "shares": n, "bot": s in bot_held}
                          for s, n in sorted(account_long.items())],
                 "triggered_today": summary.get("triggered_today", []),

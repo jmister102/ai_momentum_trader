@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from datetime import datetime, time as dtime, timedelta
 from typing import Any, Dict
 
@@ -206,6 +207,12 @@ def _print_trigger_block(trig: Trigger, enrichment: Dict[str, Any],
     print(BAR, flush=True)
 
 
+# IB is the preferred (real-time) mover source in ALL sessions. Polygon's snapshot
+# can be delayed, so it only fills the dashboard when IB has produced no movers
+# within this many seconds — and then it's labelled "(delayed)".
+IB_PREFER_SECONDS = 90
+
+
 class Trader:
     def __init__(self, ib, dry_run: bool, allow_live: bool, mode: str):
         self.ib = ib
@@ -213,22 +220,20 @@ class Trader:
         self.allow_live = allow_live
         self.mode = mode
         self._swept_date = None
+        self._last_ib_movers = None   # time.monotonic() of last non-empty IB movers
 
     def on_scan(self, summary: Dict[str, Any]) -> None:
         """Scan-cycle heartbeat → status.json for the dashboard. Tags each top
         mover with whether the IB account holds it and whether it's bot-owned.
 
-        Two scanners write here: IB owns regular hours, Polygon PM owns pre/post-
-        market. A non-authoritative scanner (e.g. IB during pre-market, where it
-        can't scan and reports no movers) must NOT wipe the authoritative scanner's
-        movers — it only refreshes the heartbeat. Otherwise the dashboard flickers
-        empty every other cycle."""
+        Two scanners write here. IB (real-time) is PREFERRED in every session;
+        Polygon's snapshot can be delayed, so it only supplies movers when IB has
+        produced none recently — and is then labelled "(delayed)". An empty scan
+        never blanks the dashboard; it just refreshes the heartbeat."""
         try:
-            session = summary.get("session")
             scanner = summary.get("scanner")
             movers = summary.get("movers", []) or []
-            is_pm = session in ("PREMARKET", "POSTMARKET")
-            authoritative = (scanner == "Polygon PM") if is_pm else (scanner == "IB")
+            now = time.monotonic()
 
             account_long = {}
             for p in self.ib.positions():
@@ -236,27 +241,41 @@ class Trader:
                 if getattr(c, "secType", "STK") == "STK" and p.position != 0:
                     account_long[c.symbol] = int(p.position)
             bot_held = fill_logger.open_bot_positions()
-
             prev = status_io.read_status() or {}
-            if not authoritative and not movers:
-                # Keep the authoritative scanner's last movers + label; just beat.
-                movers = prev.get("movers", [])
-                scanner = prev.get("scanner", scanner)
+
+            # Decide whose movers to show.
+            use_movers, label = None, scanner
+            if scanner == "IB":
+                if movers:
+                    self._last_ib_movers = now
+                    use_movers, label = movers, "IB"
+                # else: IB empty this cycle → preserve, just heartbeat
+            else:  # Polygon fallback
+                ib_fresh = (self._last_ib_movers is not None
+                            and now - self._last_ib_movers < IB_PREFER_SECONDS)
+                if movers and not ib_fresh:
+                    use_movers, label = movers, "Polygon PM (delayed)"
+                # else: IB recently supplied movers (preferred) → don't override
+
+            if use_movers is None:
+                movers_out = prev.get("movers", [])
+                label = prev.get("scanner", label)
             else:
-                for m in movers:
+                for m in use_movers:
                     sym = m.get("symbol")
                     m["held"] = sym in account_long
                     m["held_shares"] = account_long.get(sym)
                     m["bot"] = sym in bot_held
+                movers_out = use_movers
 
             status_io.write_status({
                 "running": True,
                 "mode": self.mode,
                 "pid": os.getpid(),
                 "last_poll": summary.get("ts"),
-                "session": session,
-                "scanner": scanner,
-                "movers": movers,
+                "session": summary.get("session"),
+                "scanner": label,
+                "movers": movers_out,
                 "held": [{"symbol": s, "shares": n, "bot": s in bot_held}
                          for s, n in sorted(account_long.items())],
                 "triggered_today": summary.get("triggered_today", []),

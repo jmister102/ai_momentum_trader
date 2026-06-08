@@ -53,15 +53,32 @@ def fetch_snapshot() -> List[dict]:
         return []
 
 
+def _current_price(t: dict) -> float:
+    """Best available 'now' price. In PRE-MARKET the regular-session `day.c` is 0
+    until 09:30 — the live price sits in `min.c` (last minute bar) or lastTrade.
+    Fall back through them so off-hours movers aren't invisible."""
+    day = t.get("day") or {}
+    mn = t.get("min") or {}
+    lt = t.get("lastTrade") or {}
+    return (day.get("c") or 0) or (mn.get("c") or 0) or (lt.get("p") or 0)
+
+
+def _today_volume(t: dict) -> float:
+    """Day volume, or the minute bar's accumulated volume (`av`, includes
+    pre-market) when the regular-session volume is still 0."""
+    day = t.get("day") or {}
+    mn = t.get("min") or {}
+    return (day.get("v") or 0) or (mn.get("av") or 0)
+
+
 def find_matches(tickers: List[dict]) -> List[Trigger]:
     out: List[Trigger] = []
     now = datetime.now(timezone.utc)
     for t in tickers:
-        day = t.get("day") or {}
         prev = t.get("prevDay") or {}
-        last = day.get("c") or 0
+        last = _current_price(t)
         prior = prev.get("c") or 0
-        vol = day.get("v") or 0
+        vol = _today_volume(t)
         if prior < MIN_PRIOR_CLOSE or last <= 0:
             continue
         if last / prior < MIN_GAIN_MULT:
@@ -82,9 +99,8 @@ def top_movers(tickers: List[dict], n: int = 5) -> List[dict]:
     the '% change list' shown on the dashboard during PM/AH."""
     rows = []
     for t in tickers:
-        day = t.get("day") or {}
         prev = t.get("prevDay") or {}
-        last = day.get("c") or 0
+        last = _current_price(t)
         prior = prev.get("c") or 0
         if prior <= 0 or last <= 0:
             continue

@@ -123,7 +123,6 @@ async def submit_orders(
         now_et = datetime.now(ET)
     swing = _is_swing(now_et)
     session = "swing" if swing else "intraday"
-    child_tif = "GTC" if swing else "DAY"  # GTC so swing protection survives overnight
 
     # Outside-RTH flag: a limit/stop won't fill in pre/post market without it.
     _t = now_et.timetz().replace(tzinfo=None)
@@ -164,27 +163,33 @@ async def submit_orders(
                         orderId=ib.client.getReqId(), tif="DAY", transmit=False,
                         outsideRth=outside_rth, account=acct)
 
-    # Split the position into lots, each with its OWN target+stop OCO pair (same
-    # ocaGroup, matching quantities). This is the key to safe scale-out: a partial
-    # fill of one lot's target only cancels THAT lot's stop — every other lot stays
-    # fully protected. (The old single mixed-quantity OCA cancelled the 100% stop on
-    # a partial target fill, stranding the remainder unprotected.)
-    if t2 and qty_residual > 0:
-        lots = [(qty_t1, t1), (qty_residual, float(t2))]   # scale out: T1 then T2
-    else:
-        lots = [(qty, t1)]                                 # no T2 → one full-size target
+    # Exit plan as lots, each its own target+stop OCO pair (matching quantities so a
+    # partial fill of one lot's target only cancels THAT lot's stop):
+    #   • Lot A: qty_t1 shares — take partial profit at target_1.
+    #   • Lot B: the remainder — rides on its stop, plus target_2 IF the AI set one.
+    # target_1 NEVER sells the whole position (the old "no T2 → full size at T1" bug
+    # dumped everything on a +20% tick).
+    exit_lots = [(qty_t1, t1)]                       # lot A: partial at target_1
+    if qty_residual > 0:
+        exit_lots.append((qty_residual,              # lot B: remainder rides
+                          float(t2) if t2 else None))  # target_2 if set, else stop-only
 
+    # Exits are GTC + outsideRth: a held position stays protected in EVERY session
+    # and never expires unprotected if the 15:55 sweep is missed. The sweep is the
+    # primary intraday exit; this bracket is the always-on backstop. (A DAY /
+    # RTH-only stop failed to fire when price broke it after hours.)
     children: List[Order] = []
-    for i, (lot_qty, lot_target) in enumerate(lots):
+    for i, (lot_qty, lot_target) in enumerate(exit_lots):
         lot_oca = f"{oca_group}_L{i}"
-        children.append(LimitOrder(
-            "SELL", lot_qty, round(lot_target, 2), orderId=ib.client.getReqId(),
-            tif=child_tif, parentId=parent.orderId, ocaGroup=lot_oca, ocaType=1,
-            transmit=False, outsideRth=outside_rth, account=acct))
+        if lot_target is not None:
+            children.append(LimitOrder(
+                "SELL", lot_qty, round(lot_target, 2), orderId=ib.client.getReqId(),
+                tif="GTC", parentId=parent.orderId, ocaGroup=lot_oca, ocaType=1,
+                transmit=False, outsideRth=True, account=acct))
         children.append(StopOrder(
             "SELL", lot_qty, round(stop, 2), orderId=ib.client.getReqId(),
-            tif=child_tif, parentId=parent.orderId, ocaGroup=lot_oca, ocaType=1,
-            transmit=False, outsideRth=outside_rth, account=acct))
+            tif="GTC", parentId=parent.orderId, ocaGroup=lot_oca, ocaType=1,
+            transmit=False, outsideRth=True, account=acct))
     children[-1].transmit = True   # last child transmits the whole bracket
 
     trades = [ib.placeOrder(contract, parent)]
@@ -192,9 +197,9 @@ async def submit_orders(
         trades.append(ib.placeOrder(contract, child))
 
     overnight_pct = int(decision.get("overnight_hold_pct") or 0)
-    logger.info("submitted %s bracket %s: %d sh @ %.2f | T1 %.2f x%d | stop %.2f "
-                "| T2 %s | overnight %d%% (%s)",
-                session, symbol, qty, entry, t1, qty_t1, stop, t2, overnight_pct, child_tif)
+    logger.info("submitted %s bracket %s: %d sh @ %.2f | T1 %.2f x%d (partial) | "
+                "remainder %d rides | stop %.2f | T2 %s | overnight %d%% | exits GTC",
+                session, symbol, qty, entry, t1, qty_t1, qty_residual, stop, t2, overnight_pct)
 
     rec = fill_logger.log_entry(
         symbol=symbol, entry_limit=entry, shares=qty, target_1=t1, stop=stop,
@@ -207,7 +212,7 @@ async def submit_orders(
             "qty_residual": qty_residual,
             "trail_after_target_1": bool(decision.get("trail_after_target_1")),
             "session": session, "overnight_hold_pct": overnight_pct,
-            "child_tif": child_tif,
+            "exits_tif": "GTC",
             "status": "pending_entry", "account_type": config.ACCOUNT_TYPE,
         },
     )

@@ -238,67 +238,128 @@ class Trader:
         self.per_trade_dollars = per_trade_dollars  # settled_cash / SIZE_DIVISOR
         self._swept_date = None
         self._last_ib_movers = None   # time.monotonic() of last non-empty IB movers
+        # Cached scan fields so order events can re-write status without a scan.
+        self._last_movers: list = []
+        self._last_scanner = None
+        self._last_session = None
+        self._last_poll = None
+        self._last_triggered: list = []
+        self._order_state: Dict[int, tuple] = {}   # orderId → last (status, filled, remaining)
+
+    def _account_long(self) -> Dict[str, int]:
+        """Configured account's long STOCK positions {symbol: shares}."""
+        acct = config.IB_ACCOUNT or ""
+        out = {}
+        for p in self.ib.positions():
+            if acct and getattr(p, "account", "") != acct:
+                continue
+            c = p.contract
+            if getattr(c, "secType", "STK") == "STK" and p.position != 0:
+                out[c.symbol] = int(p.position)
+        return out
+
+    def _collect_orders(self) -> list:
+        """Live order state for the dashboard — every bot order, filled or not.
+        ib.trades() on our clientId only contains orders WE placed (manual TWS
+        orders use a different clientId and don't appear)."""
+        acct = config.IB_ACCOUNT or ""
+        rows = []
+        for tr in self.ib.trades():
+            o, st, c = tr.order, tr.orderStatus, tr.contract
+            if acct and getattr(o, "account", "") and o.account != acct:
+                continue
+            if getattr(c, "secType", "STK") != "STK":
+                continue
+            lmt = o.lmtPrice or getattr(o, "auxPrice", 0) or None
+            rows.append({
+                "symbol": c.symbol, "action": o.action, "type": o.orderType,
+                "limit": round(lmt, 4) if lmt else None,
+                "qty": o.totalQuantity,
+                "filled": st.filled, "remaining": st.remaining,
+                "avg_fill": round(st.avgFillPrice, 4) if st.avgFillPrice else None,
+                "status": st.status,
+            })
+        return rows[-25:]
 
     def on_scan(self, summary: Dict[str, Any]) -> None:
-        """Scan-cycle heartbeat → status.json for the dashboard. Tags each top
-        mover with whether the IB account holds it and whether it's bot-owned.
-
-        Two scanners write here. IB (real-time) is PREFERRED in every session;
-        Polygon's snapshot can be delayed, so it only supplies movers when IB has
-        produced none recently — and is then labelled "(delayed)". An empty scan
-        never blanks the dashboard; it just refreshes the heartbeat."""
+        """Scan-cycle heartbeat. IB (real-time) movers are PREFERRED in every
+        session; delayed Polygon only fills in when IB has produced none recently.
+        An empty scan never blanks the dashboard — it just refreshes the heartbeat
+        and the live order state."""
         try:
             scanner = summary.get("scanner")
             movers = summary.get("movers", []) or []
             now = time.monotonic()
 
-            account_long = {}
-            for p in self.ib.positions():
-                c = p.contract
-                if getattr(c, "secType", "STK") == "STK" and p.position != 0:
-                    account_long[c.symbol] = int(p.position)
-            bot_held = fill_logger.open_bot_positions()
-            prev = status_io.read_status() or {}
-
-            # Decide whose movers to show.
             use_movers, label = None, scanner
             if scanner == "IB":
                 if movers:
                     self._last_ib_movers = now
                     use_movers, label = movers, "IB"
-                # else: IB empty this cycle → preserve, just heartbeat
             else:  # Polygon fallback
                 ib_fresh = (self._last_ib_movers is not None
                             and now - self._last_ib_movers < IB_PREFER_SECONDS)
                 if movers and not ib_fresh:
                     use_movers, label = movers, "Polygon PM (delayed)"
-                # else: IB recently supplied movers (preferred) → don't override
 
-            if use_movers is None:
-                movers_out = prev.get("movers", [])
-                label = prev.get("scanner", label)
-            else:
+            if use_movers is not None:
+                account_long = self._account_long()
+                bot_held = fill_logger.open_bot_positions()
                 for m in use_movers:
                     sym = m.get("symbol")
                     m["held"] = sym in account_long
                     m["held_shares"] = account_long.get(sym)
                     m["bot"] = sym in bot_held
-                movers_out = use_movers
+                self._last_movers = use_movers
+                self._last_scanner = label
 
+            self._last_session = summary.get("session")
+            self._last_poll = summary.get("ts")
+            self._last_triggered = summary.get("triggered_today", [])
+            self._write_status()
+        except Exception:
+            logger.exception("on_scan failed")
+
+    def _write_status(self) -> None:
+        """Write the full snapshot (movers + live orders + held). Called on each
+        scan cycle AND on every order event, so orders update live."""
+        try:
+            account_long = self._account_long()
+            bot_held = fill_logger.open_bot_positions()
             status_io.write_status({
                 "running": True,
                 "mode": self.mode,
                 "pid": os.getpid(),
-                "last_poll": summary.get("ts"),
-                "session": summary.get("session"),
-                "scanner": label,
-                "movers": movers_out,
+                "last_poll": self._last_poll,
+                "session": self._last_session,
+                "scanner": self._last_scanner,
+                "movers": self._last_movers,
+                "orders": self._collect_orders(),
                 "held": [{"symbol": s, "shares": n, "bot": s in bot_held}
                          for s, n in sorted(account_long.items())],
-                "triggered_today": summary.get("triggered_today", []),
+                "triggered_today": self._last_triggered,
             })
         except Exception:
-            logger.exception("on_scan/status write failed")
+            logger.exception("status write failed")
+
+    def on_order_event(self, trade) -> None:
+        """IB order/fill event → log the change to the log file and refresh the
+        dashboard immediately. Deduped so only real status/fill changes log."""
+        try:
+            o, st, c = trade.order, trade.orderStatus, trade.contract
+            sig = (st.status, st.filled, st.remaining)
+            if self._order_state.get(o.orderId) == sig:
+                return
+            self._order_state[o.orderId] = sig
+            lmt = o.lmtPrice or getattr(o, "auxPrice", 0) or 0
+            logger.info("ORDER %-6s %-4s %-6s qty=%s lmt=%.4f  status=%s "
+                        "filled=%s/%s avg=%s",
+                        c.symbol, o.action, o.orderType, o.totalQuantity, lmt,
+                        st.status, st.filled, o.totalQuantity,
+                        f"{st.avgFillPrice:.4f}" if st.avgFillPrice else "-")
+            self._write_status()
+        except Exception:
+            logger.exception("order event handler failed")
 
     async def run_pipeline(self, trig: Trigger) -> None:
         symbol = trig.symbol
@@ -379,6 +440,10 @@ async def main_async(args) -> int:
 
     trader = Trader(ib, dry_run=args.dry_run, allow_live=args.allow_live, mode=mode,
                     per_trade_dollars=per_trade)
+
+    # Live order/fill events → log + dashboard refresh (orders show even unfilled).
+    ib.orderStatusEvent += trader.on_order_event
+    ib.openOrderEvent += trader.on_order_event
 
     dash = None if args.no_dashboard else _start_dashboard(args.dashboard_host,
                                                            args.dashboard_port)

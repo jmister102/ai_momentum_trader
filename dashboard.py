@@ -60,6 +60,9 @@ PAGE = """<!doctype html>
  <h1 style="font-size:14px">Top 5 % movers <span class="muted">(✓ = account holds it)</span></h1>
  <table><thead><tr><th>#</th><th>Symbol</th><th class="num">% chg</th><th class="num">Last</th><th class="num">Prior</th><th>Held</th></tr></thead>
  <tbody id="movers"><tr><td colspan="6" class="muted">waiting for data…</td></tr></tbody></table>
+ <h1 style="font-size:14px;margin-top:22px">Orders <span class="muted">(bot orders, filled or not)</span></h1>
+ <table style="max-width:780px"><thead><tr><th>Symbol</th><th>Side</th><th>Type</th><th class="num">Limit</th><th class="num">Shares</th><th class="num">Filled</th><th class="num">Avg fill</th><th>Status</th></tr></thead>
+ <tbody id="orders"><tr><td colspan="8" class="muted">no orders yet</td></tr></tbody></table>
  <h1 style="font-size:14px;margin-top:22px">Triggered today</h1>
  <div id="trig" class="chips muted">—</div>
  <footer id="foot">polling /status.json…</footer>
@@ -88,6 +91,15 @@ async function tick(){
        '</td><td class="num">'+(m.last!=null?m.last:'—')+'</td><td class="num">'+(m.prior!=null?m.prior:'—')+'</td><td>'+held+'</td></tr>';
    }).join(''); }
   else { mv.innerHTML='<tr><td colspan="6" class="muted">no movers reported this cycle</td></tr>'; }
+  const od=document.getElementById('orders');
+  if(d.orders && d.orders.length){ od.innerHTML=d.orders.map(o=>{
+     const fillcls=(o.filled>0 && o.filled>=o.qty)?'up':(o.filled>0?'held':'muted');
+     return '<tr><td><b>'+o.symbol+'</b></td><td>'+(o.action||'')+'</td><td>'+(o.type||'')+
+       '</td><td class="num">'+(o.limit!=null?o.limit:'—')+'</td><td class="num">'+(o.qty!=null?o.qty:'—')+
+       '</td><td class="num '+fillcls+'">'+(o.filled!=null?o.filled:0)+'</td><td class="num">'+(o.avg_fill!=null?o.avg_fill:'—')+
+       '</td><td>'+(o.status||'')+'</td></tr>';
+   }).join(''); }
+  else { od.innerHTML='<tr><td colspan="8" class="muted">no orders yet</td></tr>'; }
   const tg=document.getElementById('trig');
   tg.innerHTML=(d.triggered_today&&d.triggered_today.length)? d.triggered_today.map(s=>'<span>'+s+'</span>').join('') : '<span class="muted">none yet</span>';
   document.getElementById('foot').textContent='updated '+new Date().toLocaleTimeString();

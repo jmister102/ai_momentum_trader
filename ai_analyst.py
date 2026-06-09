@@ -27,7 +27,7 @@ import config
 
 logger = logging.getLogger("ai_analyst")
 ET = pytz.timezone("America/New_York")
-MAX_TRADES = int(getattr(config, "TRADE_DIVISOR", 8))   # daily trade cap
+MAX_TRADES = int(getattr(config, "MAX_TRADES_PER_DAY", 8))   # daily trade cap
 PLAYBOOK_PATH = Path(__file__).parent / "playbook.md"
 
 

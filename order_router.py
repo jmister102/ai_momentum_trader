@@ -51,9 +51,9 @@ FORCED_EXIT = dtime(15, 55)
 NOON_ET = dtime(12, 0)
 MIN_MINUTES_TO_ENTER = 30   # intraday only; swing entries have no same-day exit need
 TRAIL_PERCENT = 15.0
-# Per-trade $ size = settled_cash / TRADE_DIVISOR; at most TRADE_DIVISOR trades/day,
-# so total deployment ≤ settled cash (cash account: no trading on unsettled funds).
-MAX_TRADES_PER_DAY = int(getattr(config, "TRADE_DIVISOR", 8))
+# Daily trade cap (per-trade $ = settled_cash / SIZE_DIVISOR is applied in run_trader).
+# Keep SIZE_DIVISOR ≥ this so total deployment ≤ settled cash (no unsettled-funds trading).
+MAX_TRADES_PER_DAY = int(getattr(config, "MAX_TRADES_PER_DAY", 8))
 
 
 def _is_swing(now_et: datetime) -> bool:
@@ -95,7 +95,7 @@ async def submit_orders(
     Validate guards, build the bracket, transmit. Returns the logged entry
     record on success, or None if the order was rejected (reason logged).
 
-    dollar_size = settled_cash / TRADE_DIVISOR (the per-trade ceiling).
+    dollar_size = settled_cash / SIZE_DIVISOR (the per-trade ceiling).
     """
     if decision.get("decision") != "GO":
         logger.info("not a GO for %s — nothing to submit", symbol)
@@ -112,7 +112,7 @@ async def submit_orders(
                        dollar_size, symbol)
         return None
 
-    # ── daily limit (TRADE_DIVISOR trades/day) ──
+    # ── daily limit (MAX_TRADES_PER_DAY) ──
     n = fill_logger.trades_today()
     if n >= MAX_TRADES_PER_DAY:
         logger.warning("Daily trade limit reached (%d/%d) — rejecting %s",

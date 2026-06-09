@@ -11,7 +11,8 @@ IB_CLIENT_ID = 1           # order_router / run_trader uses this
 IB_SCANNER_CLIENT_ID = 11  # trigger_monitor uses a separate id so both can share one Gateway session
 
 IB_ACCOUNT = ""            # account id to trade (run account_info.py to find it); required if you have >1 account
-TRADE_DIVISOR = 8          # per-trade size = settled_cash / TRADE_DIVISOR; also the max trades/day
+SIZE_DIVISOR = 8           # per-trade $ = settled_cash / SIZE_DIVISOR
+MAX_TRADES_PER_DAY = 8     # daily trade cap (keep SIZE_DIVISOR ≥ this → deployment ≤ settled cash)
 
 POLYGON_API_KEY = "your_polygon_key"
 ANTHROPIC_API_KEY = "your_anthropic_key"

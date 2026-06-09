@@ -1,10 +1,10 @@
 """
 account.py — IB account cash helpers (settled cash etc.).
 
-The strategy sizes each trade at settled_cash / TRADE_DIVISOR (8) and caps the
-day at TRADE_DIVISOR trades, so total deployment never exceeds settled cash —
-important for a cash account (no trading on unsettled funds → no good-faith
-violations).
+The strategy sizes each trade at settled_cash / SIZE_DIVISOR and caps the day at
+MAX_TRADES_PER_DAY trades; keeping SIZE_DIVISOR ≥ the cap means total deployment
+never exceeds settled cash — important for a cash account (no trading on unsettled
+funds → no good-faith violations).
 
 `SettledCash` (IB account-summary tag) is exactly "cash recognized at settlement
 less purchases at trade time, commissions, taxes, fees" — the right baseline.

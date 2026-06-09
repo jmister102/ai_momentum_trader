@@ -62,8 +62,8 @@ ACCOUNT_TYPE = "paper"  # "paper" or "live" — safety guard reads this
 ## Safety Rules (non-negotiable, enforce in every file)
 
 1. **Account guard**: on startup, read `ACCOUNT_TYPE` from `config.py`. If `"live"`, require `--allow-live` CLI flag or abort. Log a warning to console either way.
-2. **Max `TRADE_DIVISOR` trades per calendar day** (default 8; updated 2026-06-08, was 2): `order_router.py` reads `fills.jsonl`, counts entries for today. If count ≥ `TRADE_DIVISOR`, reject new orders and log `"Daily trade limit reached"`. Cash account (Roth IRA) → no PDT limit.
-3. **Position size** (updated 2026-06-08, was fixed $200): `floor((settled_cash / TRADE_DIVISOR) / entry_price)` shares. Settled cash is read once at startup for `IB_ACCOUNT`; per-trade = settled_cash/8 and ≤8 trades means total deployment ≤ settled cash (no trading on unsettled funds). Orders are placed on `config.IB_ACCOUNT`.
+2. **Max `MAX_TRADES_PER_DAY` trades per calendar day** (config; updated 2026-06-09, decoupled from size): `order_router.py` counts today's entries in `fills.jsonl`; if count ≥ `MAX_TRADES_PER_DAY`, reject new orders and log `"Daily trade limit reached"`. Cash account (Roth IRA) → no PDT limit.
+3. **Position size** (updated 2026-06-09): `floor((settled_cash / SIZE_DIVISOR) / entry_price)` shares. Settled cash is read once at startup for `IB_ACCOUNT`. Keeping `SIZE_DIVISOR ≥ MAX_TRADES_PER_DAY` means total deployment ≤ settled cash (no trading on unsettled funds). Orders are placed on `config.IB_ACCOUNT`.
 4. **Holding window keyed to entry time** (updated 2026-06-02, supersedes the original intraday-only rule):
    - **Entry before 12:00 ET (intraday)**: closed by 15:55 ET the same day. `overnight_hold_pct` MUST be 0. DAY brackets.
    - **Entry at/after 12:00 ET (swing-eligible)**: the AI may carry `overnight_hold_pct` (0–100%) of the position overnight. Carried shares ride a **GTC** stop/target and are **force-closed by the NEXT day's 15:55 sweep** (max one overnight). Late-day entries are NOT eliminated — the ≥30-min-before-close cutoff applies to intraday entries only.

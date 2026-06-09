@@ -235,7 +235,7 @@ class Trader:
         self.dry_run = dry_run
         self.allow_live = allow_live
         self.mode = mode
-        self.per_trade_dollars = per_trade_dollars  # settled_cash / TRADE_DIVISOR
+        self.per_trade_dollars = per_trade_dollars  # settled_cash / SIZE_DIVISOR
         self._swept_date = None
         self._last_ib_movers = None   # time.monotonic() of last non-empty IB movers
 
@@ -364,10 +364,10 @@ async def main_async(args) -> int:
 
     mode = "DRY-RUN" if args.dry_run else ("LIVE" if args.allow_live else "PAPER")
 
-    # Daily sizing baseline: per-trade = settled_cash / TRADE_DIVISOR, fetched once
+    # Daily sizing baseline: per-trade = settled_cash / SIZE_DIVISOR, fetched once
     # at startup for the configured account.
     cfg_acct = config.IB_ACCOUNT or (ib.managedAccounts()[0] if ib.managedAccounts() else "")
-    divisor = int(getattr(config, "TRADE_DIVISOR", 8))
+    divisor = int(getattr(config, "SIZE_DIVISOR", 8))
     settled = await account_mod.settled_cash(ib, cfg_acct)
     per_trade = (settled / divisor) if settled else 0.0
     if settled:

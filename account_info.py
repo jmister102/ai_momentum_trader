@@ -19,7 +19,7 @@ import asyncio
 import account as acct
 import config
 
-DIVISOR = getattr(config, "TRADE_DIVISOR", 8)
+DIVISOR = getattr(config, "SIZE_DIVISOR", 8)
 
 
 async def _amain(client_id: int) -> int:
@@ -53,7 +53,7 @@ async def _amain(client_id: int) -> int:
         sc = acct.value_for(rows, account, "SettledCash")
         if sc is not None:
             print(f"  {'→ per-trade':<16} {sc/DIVISOR:,.2f}   "
-                  f"(settled_cash / {DIVISOR}, up to {DIVISOR} trades/day)")
+                  f"(settled_cash / {DIVISOR})")
         print()
 
     ib.disconnect()

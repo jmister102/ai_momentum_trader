@@ -142,6 +142,7 @@ async def enrich(
     result: Dict[str, Any] = {
         "symbol": symbol,
         "last_price": last_price_hint,
+        "ask": None,           # entry is priced off the ask (see ai_analyst.entry_for)
         "prior_close": prior_close_hint,
         "pct_gain_today": None,
         "volume_today": None,
@@ -171,6 +172,8 @@ async def enrich(
                 break
         if ticker.last and ticker.last > 0:
             result["last_price"] = float(ticker.last)
+        if getattr(ticker, "ask", None) and ticker.ask > 0:
+            result["ask"] = float(ticker.ask)
         if ticker.close and ticker.close > 0:
             result["prior_close"] = float(ticker.close)
         if ticker.volume and ticker.volume > 0:

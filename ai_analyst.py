@@ -40,16 +40,22 @@ def _load_playbook() -> str:
     except (FileNotFoundError, OSError):
         return ""
 
-ENTRY_MARKUP = 0.10         # entry_limit = current price × (1 + this). A marketable
-                            # limit ~10% ABOVE last so a fast-moving stock still
-                            # fills (a limit at/below market won't fill on a runner).
+ENTRY_MARKUP = 0.05         # entry_limit = ask × (1 + this). A marketable limit ~5%
+                            # ABOVE the ASK: crosses to fill on a runner, but stays
+                            # under IB's price-aggressiveness cap (10%-above-last
+                            # tripped Error 202 "more aggressive than … market").
 MIN_TARGET_MULT = 1.20      # target_1 ≥ entry × 1.20
 MIN_STOP_MULT = 0.50        # stop ≥ entry × 0.50
 
 
-def entry_for(last_price: float) -> float:
-    """The marketable entry limit: ~10% above the current price."""
-    return round(last_price * (1 + ENTRY_MARKUP), 2)
+def entry_reference(enrichment: Dict[str, Any]) -> Optional[float]:
+    """Price the entry off the ASK (the actual offer we cross); fall back to last."""
+    return enrichment.get("ask") or enrichment.get("last_price")
+
+
+def entry_for(reference_price: float) -> float:
+    """The marketable entry limit: ~5% above the ask (or last fallback)."""
+    return round(reference_price * (1 + ENTRY_MARKUP), 2)
 
 SYSTEM_PROMPT = """\
 You are an expert intraday trading analyst specializing in small-cap momentum stocks.
@@ -79,7 +85,7 @@ positions can be held overnight (see HOLDING WINDOW).
 
 HARD RULES YOU MUST FOLLOW (non-negotiable):
 - Trade size is fixed at $200 regardless of your confidence.
-- Entry: your entry_limit is FIXED at ~10% ABOVE the current price — a marketable
+- Entry: your entry_limit is FIXED at ~5% ABOVE the ask — a marketable
   limit so a fast-moving stock still fills (a limit at or below market will NOT
   fill on a runner). Use EXACTLY the "Entry limit to use" value given below as your
   entry_limit, and set target_1 and stop relative to THAT value.
@@ -100,7 +106,7 @@ Schema:
 {
   "decision": "GO" | "NO-GO",
   "confidence": 0.0-1.0,
-  "entry_limit": <float, = the "Entry limit to use" value (~10% above current)>,
+  "entry_limit": <float, = the "Entry limit to use" value (~5% above the ask)>,
   "target_1_price": <float, ≥ entry × 1.20>,
   "target_1_pct_shares": <int, 25-75>,
   "target_2_price": <float | null, > target_1 if present>,
@@ -119,7 +125,7 @@ TRIGGER ALERT — {symbol}
 
 ## Market Context
 - Current price: ${last_price}
-- Entry limit to use: ${entry_to_use}  ← USE THIS as entry_limit (~10% above current; marketable, fills on a runner)
+- Entry limit to use: ${entry_to_use}  ← USE THIS as entry_limit (~5% above the ask; marketable, fills on a runner)
 - Prior close: ${prior_close}
 - Gain today: +{pct_gain_today}
 - 2× prior close: ${entry_limit}  (the trigger level — informational only)
@@ -242,7 +248,8 @@ def build_user_prompt(
     else:
         news_block = "- (no recent headlines found)"
 
-    entry_to_use = _fmt(entry_for(last), "price") if last else "unknown"
+    ref = entry_reference(e)
+    entry_to_use = _fmt(entry_for(ref), "price") if ref else "unknown"
 
     prompt = USER_PROMPT_TEMPLATE.format(
         symbol=e.get("symbol", "?"),
@@ -291,19 +298,19 @@ def _no_go(reason: str, raw: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
-def _validate(decision: Dict[str, Any], last_price: Optional[float],
+def _validate(decision: Dict[str, Any], reference_price: Optional[float],
               now_et: Optional[datetime] = None) -> Dict[str, Any]:
     """Enforce the non-negotiable guardrails. Demote to NO-GO on any breach."""
     if decision.get("decision") != "GO":
         return decision
-    if not last_price:
-        return _no_go("validation: current price unknown, cannot verify entry")
+    if not reference_price:
+        return _no_go("validation: ask/last unknown, cannot price entry")
 
-    # Entry is DETERMINISTIC: a marketable limit ~10% above the current price so
-    # the order fills on a runner (a limit at/below market won't fill). Override
-    # whatever the model returned — it was shown this exact value ("Entry limit to
-    # use") and told to set target_1/stop relative to it.
-    entry = entry_for(last_price)
+    # Entry is DETERMINISTIC: a marketable limit ~5% above the ask so the order
+    # fills on a runner without tripping IB's price-aggressiveness cap (Error 202).
+    # Override whatever the model returned — it was shown this exact value
+    # ("Entry limit to use") and told to set target_1/stop relative to it.
+    entry = entry_for(reference_price)
     decision["entry_limit"] = entry
     t1 = decision.get("target_1_price")
     stop = decision.get("stop_loss_price")
@@ -385,7 +392,7 @@ def call_ai(
         return _no_go("AI returned malformed JSON", raw=raw)
 
     decision["_raw"] = raw
-    return _validate(decision, enrichment.get("last_price"), now_et)
+    return _validate(decision, entry_reference(enrichment), now_et)
 
 
 # ── standalone test ───────────────────────────────────────────────────────────

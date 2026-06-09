@@ -274,7 +274,11 @@ class Trader:
                 continue
             if getattr(c, "secType", "STK") != "STK":
                 continue
-            lmt = o.lmtPrice or getattr(o, "auxPrice", 0) or None
+            # IB uses DBL_MAX (~1.8e308) as the "unset" price sentinel (e.g. on MKT
+            # orders). Treat it as None so the dashboard shows "—", not 1.8e308.
+            def _px(v):
+                return v if (v and 0 < v < 1e12) else None
+            lmt = _px(o.lmtPrice) or _px(getattr(o, "auxPrice", 0))
             rows.append({
                 "symbol": c.symbol, "action": o.action, "type": o.orderType,
                 "limit": round(lmt, 4) if lmt else None,

@@ -25,6 +25,6 @@ $env:PYTHONUTF8 = "1"
 # UTF-8 bytes, so the log stays clean UTF-8. PowerShell's redirect would re-encode
 # to UTF-16 and garble it. --dry-run = live data, NO orders; change to --allow-live
 # only when you have deliberately decided to place real orders.
-cmd /c "py run_trader.py --dry-run >> ""$log"" 2>&1"
+cmd /c "py run_trader.py --allow-live >> ""$log"" 2>&1"
 
 "===== EXIT $LASTEXITCODE  $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') =====" | Out-File -Append -Encoding utf8 $log

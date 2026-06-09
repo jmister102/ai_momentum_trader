@@ -326,13 +326,27 @@ def _cancel_symbol_orders(ib: IB, symbol: str) -> None:
             logger.exception("cancel failed for %s", symbol)
 
 
-def _market_sell(ib: IB, contract, qty: int, real_position: int) -> None:
+def _flatten(ib: IB, contract, qty: int, stop_price: Optional[float],
+             real_position: int) -> None:
+    """Force-exit qty via a MARKETABLE LIMIT (+ paired GTC stop, OCO) instead of a
+    plain market order. Plain market orders get DISCARDED by IB if they can't fill
+    by the close (halt / thin book on these microcaps), leaving the position naked.
+    A sell-limit at the stop price is "sell at ≥ stop, fill at the higher bid" —
+    marketable for a winner, won't dump below the stop — and if the name is HALTED
+    both orders rest so the position stays protected and exits when it resumes."""
     if qty < real_position:
-        logger.warning("%s: selling %d of %d total shares (manual/carry preserved)",
+        logger.warning("%s: exiting %d of %d total shares (manual/carry preserved)",
                        contract.symbol, qty, real_position)
-    ib.placeOrder(contract, MarketOrder("SELL", qty, tif="DAY",
-                                        orderId=ib.client.getReqId(), account=_acct()))
-    logger.warning("market-sell %s x%d (forced)", contract.symbol, qty)
+    sp = round(float(stop_price), 2) if stop_price else 0.01
+    oca = f"FLAT_{contract.symbol}_{qty}"
+    lim = LimitOrder("SELL", qty, sp, tif="GTC", outsideRth=True, account=_acct(),
+                     orderId=ib.client.getReqId(), ocaGroup=oca, ocaType=1, transmit=False)
+    stp = StopOrder("SELL", qty, sp, tif="GTC", outsideRth=True, account=_acct(),
+                    orderId=ib.client.getReqId(), ocaGroup=oca, ocaType=1, transmit=True)
+    ib.placeOrder(contract, lim)
+    ib.placeOrder(contract, stp)
+    logger.warning("forced-exit %s x%d: marketable LMT + GTC stop @ %.2f (OCO; "
+                   "fills at the bid, protected if halted)", contract.symbol, qty, sp)
 
 
 def _log_forced_exit(symbol: str, pos, qty: int, note: str) -> Dict[str, Any]:
@@ -420,17 +434,19 @@ def forced_exit_sweep(ib: IB, allow_live: bool = False,
         session = info["session"]
         carry_pct = int(info["overnight_hold_pct"] or 0)
 
+        stop_px = info.get("stop")
+
         # CASE 1 — prior-day overnight hold → backstop flatten.
         if held_from is not None and held_from < today:
             _cancel_symbol_orders(ib, sym)
-            _market_sell(ib, contract, sellable, real)
+            _flatten(ib, contract, sellable, stop_px, real)
             exits.append(_log_forced_exit(sym, pos, sellable, "next-day backstop"))
             continue
 
         # CASE 2 — intraday entry today → flatten.
         if session != "swing":
             _cancel_symbol_orders(ib, sym)
-            _market_sell(ib, contract, sellable, real)
+            _flatten(ib, contract, sellable, stop_px, real)
             exits.append(_log_forced_exit(sym, pos, sellable, "intraday 15:55"))
             continue
 
@@ -439,7 +455,7 @@ def forced_exit_sweep(ib: IB, allow_live: bool = False,
         excess = sellable - carry
         _cancel_symbol_orders(ib, sym)
         if excess > 0:
-            _market_sell(ib, contract, excess, real)
+            _flatten(ib, contract, excess, stop_px, real)
             exits.append(_log_forced_exit(
                 sym, pos, excess, f"swing day-portion ({carry_pct}% carried overnight)"))
         if carry > 0:

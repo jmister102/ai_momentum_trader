@@ -26,14 +26,11 @@ _PREFERRED_CCY = ("USD", "BASE", "")
 
 
 async def account_summary_rows(ib) -> List:
-    """List[AccountValue(account, tag, value, currency)] across all accounts."""
-    try:
-        await ib.reqAccountSummaryAsync()
-    except TypeError:
-        # Older ib_insync: sync request, then read the cache.
-        ib.reqAccountSummary()
-        await ib.sleep(2.5) if hasattr(ib, "sleep") else None
-    return list(ib.accountSummary())
+    """List[AccountValue(account, tag, value, currency)] across all accounts.
+
+    Use accountSummaryAsync (NOT the sync accountSummary, which spins its own loop
+    and blows up — "event loop is already running" — inside asyncio.run)."""
+    return list(await ib.accountSummaryAsync())
 
 
 def value_for(rows: List, account: str, tag: str,

@@ -341,6 +341,9 @@ class Trader:
                 "orders": self._collect_orders(),
                 "held": [{"symbol": s, "shares": n, "bot": s in bot_held}
                          for s, n in sorted(account_long.items())],
+                "trades_today": fill_logger.trades_today(),
+                "max_trades": int(getattr(config, "MAX_TRADES_PER_DAY", 8)),
+                "per_trade": round(self.per_trade_dollars, 2),
                 "triggered_today": self._last_triggered,
             })
         except Exception:
@@ -513,9 +516,16 @@ async def main_async(args) -> int:
         pm = PolygonPMScanner(on_trigger=trader.run_pipeline, on_scan=trader.on_scan)
         tasks.append(asyncio.create_task(pm.run()))
 
+    # Trade budget — logged on every restart and shown on the dashboard.
+    used = fill_logger.trades_today()
+    cap = int(getattr(config, "MAX_TRADES_PER_DAY", 8))
+    logger.info("Trades today: %d / %d allowed  (per-trade ~$%.0f)",
+                used, cap, per_trade)
+
     dash_line = (f"\n  Dashboard: http://{args.dashboard_host}:{args.dashboard_port}"
                  if dash is not None else "")
     print(f"\n{BAR}\n  AI Momentum Trader running — {mode} mode  (session: {session_now()})"
+          f"\n  Trades today: {used} / {cap} allowed  |  per-trade ~${per_trade:.0f}"
           f"{dash_line}\n  Ctrl-C to stop\n{BAR}\n", flush=True)
 
     try:

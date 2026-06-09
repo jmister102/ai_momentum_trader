@@ -55,6 +55,8 @@ PAGE = """<!doctype html>
    <div class="kv"><b>Last poll</b><span id="poll">—</span></div>
    <div class="kv"><b>Session</b><span id="sess">—</span></div>
    <div class="kv"><b>Scanner</b><span id="scan">—</span></div>
+   <div class="kv"><b>Trades today</b><span id="trades">—</span></div>
+   <div class="kv"><b>Per-trade</b><span id="pertrade">—</span></div>
    <div class="kv"><b>PID</b><span id="pid">—</span></div>
  </div>
  <h1 style="font-size:14px">Top 5 % movers <span class="muted">(✓ = account holds it)</span></h1>
@@ -83,6 +85,10 @@ async function tick(){
   document.getElementById('poll').textContent=(d.last_poll? d.last_poll.replace('T',' '):'—')+'  ('+agetxt+')';
   document.getElementById('sess').textContent=d.session||'—';
   document.getElementById('scan').textContent=d.scanner||'—';
+  const tt=(d.trades_today!=null?d.trades_today:'—')+' / '+(d.max_trades!=null?d.max_trades:'—');
+  const tEl=document.getElementById('trades'); tEl.textContent=tt;
+  tEl.className=(d.max_trades!=null && d.trades_today>=d.max_trades)?'held':'';
+  document.getElementById('pertrade').textContent=(d.per_trade!=null?('$'+d.per_trade):'—');
   document.getElementById('pid').textContent=d.pid||'—';
   const mv=document.getElementById('movers');
   if(d.movers && d.movers.length){ mv.innerHTML=d.movers.map((m,i)=>{

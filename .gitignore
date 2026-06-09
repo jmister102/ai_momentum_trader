@@ -9,6 +9,9 @@ triggers.jsonl
 status.json
 status.json.tmp
 
+# Learned IBKR compliance blocklist (account-specific runtime state)
+blocklist.json
+
 # Retrospective: decision log, generated reports, learned playbook
 # (playbook.md is curated knowledge — `git add -f playbook.md` if you want it versioned)
 decisions.jsonl

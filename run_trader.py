@@ -30,6 +30,7 @@ from typing import Any, Dict
 import pytz
 
 import account as account_mod
+import blocklist
 import config
 import decision_log
 import fill_logger
@@ -388,17 +389,31 @@ class Trader:
                     and st.status in ("Cancelled", "Inactive", "ApiCancelled")
                     and o.orderId not in self._rejected_logged):
                 self._rejected_logged.add(o.orderId)
+                why = self._order_errors.get(o.orderId)
                 fill_logger.log_event("entry_rejected", symbol=c.symbol,
-                                      order_id=o.orderId,
-                                      reason=self._order_errors.get(o.orderId))
+                                      order_id=o.orderId, reason=why)
                 logger.info("entry %s rejected/cancelled without fill — daily trade "
                             "slot freed", c.symbol)
+                # IBKR won't let us open this name (compliance / closing-only / no
+                # permission) → blocklist it so we never re-attempt it.
+                if why and any(k in why for k in
+                               ("No Trading Permission", "Ineligible",
+                                "closing-only", "No Opening Trades", "201")):
+                    blocklist.add(c.symbol, why)
+                    logger.warning("%s → IBKR compliance blocklist; future triggers "
+                                   "will be skipped", c.symbol)
             self._write_status()
         except Exception:
             logger.exception("order event handler failed")
 
     async def run_pipeline(self, trig: Trigger) -> None:
         symbol = trig.symbol
+        # Skip symbols IBKR won't let us open (learned from past 201 rejects) before
+        # spending an enrich + AI call + order attempt on them.
+        if blocklist.is_blocked(symbol):
+            logger.info("skip %s — on IBKR compliance blocklist (%s)",
+                        symbol, blocklist.reason(symbol))
+            return
         logger.info("pipeline start %s", symbol)
         try:
             enrichment = await enrich(

@@ -164,29 +164,28 @@ async def submit_orders(
                         orderId=ib.client.getReqId(), tif="DAY", transmit=False,
                         outsideRth=outside_rth, account=acct)
 
-    children: List[Order] = []
-
-    # Target 1 (partial), OCA.
-    tgt1 = LimitOrder("SELL", qty_t1, round(t1, 2),
-                      orderId=ib.client.getReqId(), tif=child_tif,
-                      parentId=parent.orderId, ocaGroup=oca_group, ocaType=1,
-                      transmit=False, outsideRth=outside_rth, account=acct)
-    children.append(tgt1)
-
-    # Optional target 2 on the residual.
+    # Split the position into lots, each with its OWN target+stop OCO pair (same
+    # ocaGroup, matching quantities). This is the key to safe scale-out: a partial
+    # fill of one lot's target only cancels THAT lot's stop — every other lot stays
+    # fully protected. (The old single mixed-quantity OCA cancelled the 100% stop on
+    # a partial target fill, stranding the remainder unprotected.)
     if t2 and qty_residual > 0:
-        tgt2 = LimitOrder("SELL", qty_residual, round(float(t2), 2),
-                          orderId=ib.client.getReqId(), tif=child_tif,
-                          parentId=parent.orderId, ocaGroup=oca_group, ocaType=1,
-                          transmit=False, outsideRth=outside_rth, account=acct)
-        children.append(tgt2)
+        lots = [(qty_t1, t1), (qty_residual, float(t2))]   # scale out: T1 then T2
+    else:
+        lots = [(qty, t1)]                                 # no T2 → one full-size target
 
-    # Stop on 100% of shares, OCA — transmit=True on the last child fires the batch.
-    stp = StopOrder("SELL", qty, round(stop, 2),
-                    orderId=ib.client.getReqId(), tif=child_tif,
-                    parentId=parent.orderId, ocaGroup=oca_group, ocaType=1,
-                    transmit=True, outsideRth=outside_rth, account=acct)
-    children.append(stp)
+    children: List[Order] = []
+    for i, (lot_qty, lot_target) in enumerate(lots):
+        lot_oca = f"{oca_group}_L{i}"
+        children.append(LimitOrder(
+            "SELL", lot_qty, round(lot_target, 2), orderId=ib.client.getReqId(),
+            tif=child_tif, parentId=parent.orderId, ocaGroup=lot_oca, ocaType=1,
+            transmit=False, outsideRth=outside_rth, account=acct))
+        children.append(StopOrder(
+            "SELL", lot_qty, round(stop, 2), orderId=ib.client.getReqId(),
+            tif=child_tif, parentId=parent.orderId, ocaGroup=lot_oca, ocaType=1,
+            transmit=False, outsideRth=outside_rth, account=acct))
+    children[-1].transmit = True   # last child transmits the whole bracket
 
     trades = [ib.placeOrder(contract, parent)]
     for child in children:

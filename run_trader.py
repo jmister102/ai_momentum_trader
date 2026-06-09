@@ -38,7 +38,8 @@ import status as status_io
 from ai_analyst import call_ai
 from chart_builder import build_chart
 from enricher import enrich
-from order_router import forced_exit_sweep, shares_for, submit_orders
+from order_router import (forced_exit_sweep, maybe_start_twap, shares_for,
+                          submit_orders)
 from polygon_pm_scanner import PolygonPMScanner
 from trigger_monitor import (Trigger, TriggerMonitor, quiet_scanner_cancel_noise,
                              session_now)
@@ -385,6 +386,12 @@ class Trader:
                         c.symbol, o.action, o.orderType, o.totalQuantity, lmt,
                         st.status, st.filled, o.totalQuantity,
                         f"{st.avgFillPrice:.4f}" if st.avgFillPrice else "-")
+
+            # When target_1 fills, scale the remainder out via a TWAP until 15:54.
+            twapped = maybe_start_twap(self.ib, o.orderId, st.status, st.filled)
+            if twapped:
+                logger.info("target_1 filled %s — TWAP scale-out started for %d "
+                            "remainder shares", c.symbol, twapped)
 
             # A bot ENTRY (BUY) that terminated without filling (e.g. a closing-only
             # symbol) never opened a position → don't count it toward the daily cap.

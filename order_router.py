@@ -35,11 +35,12 @@ from typing import Any, Dict, List, Optional
 import pytz
 
 try:
-    from ib_insync import IB, Stock, LimitOrder, StopOrder, MarketOrder, Order
+    from ib_insync import (IB, Stock, LimitOrder, StopOrder, MarketOrder, Order,
+                           TagValue)
     _IB_AVAILABLE = True
 except ImportError:
     _IB_AVAILABLE = False
-    IB = Stock = LimitOrder = StopOrder = MarketOrder = Order = object  # type: ignore
+    IB = Stock = LimitOrder = StopOrder = MarketOrder = Order = TagValue = object  # type: ignore
 
 import config
 import fill_logger
@@ -51,6 +52,12 @@ FORCED_EXIT = dtime(15, 55)
 NOON_ET = dtime(12, 0)
 MIN_MINUTES_TO_ENTER = 30   # intraday only; swing entries have no same-day exit need
 TRAIL_PERCENT = 15.0
+TWAP_END = dtime(15, 54)    # TWAP exits complete just before the 15:55 sweep
+
+# target_1 orderId → info needed to TWAP the remainder when it fills. Populated by
+# submit_orders, consumed by maybe_start_twap (called from run_trader's order
+# handler). Module-level so the order logic stays in one place.
+_pending_twap: Dict[int, dict] = {}
 # Daily trade cap (per-trade $ = settled_cash / SIZE_DIVISOR is applied in run_trader).
 # Keep SIZE_DIVISOR ≥ this so total deployment ≤ settled cash (no unsettled-funds trading).
 MAX_TRADES_PER_DAY = int(getattr(config, "MAX_TRADES_PER_DAY", 8))
@@ -163,38 +170,43 @@ async def submit_orders(
                         orderId=ib.client.getReqId(), tif="DAY", transmit=False,
                         outsideRth=outside_rth, account=acct)
 
-    # Exit plan as lots, each its own target+stop OCO pair (matching quantities so a
-    # partial fill of one lot's target only cancels THAT lot's stop):
-    #   • Lot A: qty_t1 shares — take partial profit at target_1.
-    #   • Lot B: the remainder — rides on its stop, plus target_2 IF the AI set one.
-    # target_1 NEVER sells the whole position (the old "no T2 → full size at T1" bug
-    # dumped everything on a +20% tick).
-    exit_lots = [(qty_t1, t1)]                       # lot A: partial at target_1
-    if qty_residual > 0:
-        exit_lots.append((qty_residual,              # lot B: remainder rides
-                          float(t2) if t2 else None))  # target_2 if set, else stop-only
-
-    # Exits are GTC + outsideRth: a held position stays protected in EVERY session
-    # and never expires unprotected if the 15:55 sweep is missed. The sweep is the
-    # primary intraday exit; this bracket is the always-on backstop. (A DAY /
-    # RTH-only stop failed to fire when price broke it after hours.)
+    # Exit plan:
+    #   • Lot A (qty_t1): take partial profit at target_1 (LMT) + its stop (OCO).
+    #   • Lot B (remainder): STOP-ONLY for now. When target_1 fills, the remainder is
+    #     scaled out via a TWAP until 15:54 (see maybe_start_twap) — a gentler exit
+    #     for a runner than a resting target_2. Until then the remainder stop protects.
+    # target_1 NEVER sells the whole position. Exits are GTC + outsideRth so they
+    # persist and trigger in every session (a DAY/RTH-only stop failed to fire after
+    # hours), and per-lot stops sum to the full position.
     children: List[Order] = []
-    for i, (lot_qty, lot_target) in enumerate(exit_lots):
-        lot_oca = f"{oca_group}_L{i}"
-        if lot_target is not None:
-            children.append(LimitOrder(
-                "SELL", lot_qty, round(lot_target, 2), orderId=ib.client.getReqId(),
-                tif="GTC", parentId=parent.orderId, ocaGroup=lot_oca, ocaType=1,
-                transmit=False, outsideRth=True, account=acct))
-        children.append(StopOrder(
-            "SELL", lot_qty, round(stop, 2), orderId=ib.client.getReqId(),
-            tif="GTC", parentId=parent.orderId, ocaGroup=lot_oca, ocaType=1,
-            transmit=False, outsideRth=True, account=acct))
+    tgt1 = LimitOrder("SELL", qty_t1, round(t1, 2), orderId=ib.client.getReqId(),
+                      tif="GTC", parentId=parent.orderId, ocaGroup=f"{oca_group}_L0",
+                      ocaType=1, transmit=False, outsideRth=True, account=acct)
+    stop_a = StopOrder("SELL", qty_t1, round(stop, 2), orderId=ib.client.getReqId(),
+                       tif="GTC", parentId=parent.orderId, ocaGroup=f"{oca_group}_L0",
+                       ocaType=1, transmit=False, outsideRth=True, account=acct)
+    children += [tgt1, stop_a]
+
+    rem_stop = None
+    if qty_residual > 0:
+        rem_stop = StopOrder("SELL", qty_residual, round(stop, 2),
+                             orderId=ib.client.getReqId(), tif="GTC",
+                             parentId=parent.orderId, ocaGroup=f"{oca_group}_L1",
+                             ocaType=1, transmit=False, outsideRth=True, account=acct)
+        children.append(rem_stop)
     children[-1].transmit = True   # last child transmits the whole bracket
 
     trades = [ib.placeOrder(contract, parent)]
     for child in children:
         trades.append(ib.placeOrder(contract, child))
+
+    # When target_1 fills, TWAP the remainder out (run_trader's order handler calls
+    # maybe_start_twap on every fill).
+    if rem_stop is not None:
+        _pending_twap[tgt1.orderId] = {
+            "symbol": symbol, "contract": contract, "qty": qty_residual,
+            "stop": stop, "stop_order_id": rem_stop.orderId, "account": acct,
+        }
 
     overnight_pct = int(decision.get("overnight_hold_pct") or 0)
     logger.info("submitted %s bracket %s: %d sh @ %.2f | T1 %.2f x%d (partial) | "
@@ -217,6 +229,73 @@ async def submit_orders(
         },
     )
     return rec
+
+
+def maybe_start_twap(ib: IB, order_id: int, status: str,
+                     filled: float) -> Optional[int]:
+    """Called from run_trader on every order event. If order_id is a target_1 whose
+    FILL should trigger a TWAP scale-out of the remainder, place it. Returns the
+    number of shares TWAP'd, or None. Cleans up the registry on a terminal non-fill
+    (e.g. the stop hit before target_1)."""
+    info = _pending_twap.get(order_id)
+    if info is None:
+        return None
+    if status in ("Cancelled", "Inactive", "ApiCancelled") and (filled or 0) <= 0:
+        _pending_twap.pop(order_id, None)   # stop hit first / cancelled → no TWAP
+        return None
+    if status != "Filled" or (filled or 0) <= 0:
+        return None
+    _pending_twap.pop(order_id, None)
+    return _start_twap_exit(ib, info)
+
+
+def _start_twap_exit(ib: IB, info: dict, now_et: Optional[datetime] = None) -> Optional[int]:
+    """Scale the remainder out via a TWAP (IBALGO) until 15:54, with a reduce-OCO
+    stop for downside. If placement fails, leave the existing remainder stop in
+    place — never strand the position unprotected."""
+    if now_et is None:
+        now_et = datetime.now(ET)
+    end_et = now_et.replace(hour=TWAP_END.hour, minute=TWAP_END.minute,
+                            second=0, microsecond=0)
+    if end_et <= now_et:
+        logger.info("past TWAP window (%s) — %s remainder stays on its stop",
+                    TWAP_END.strftime("%H:%M"), info["symbol"])
+        return None
+    contract, qty, acct = info["contract"], int(info["qty"]), info["account"]
+    end_str = end_et.strftime("%Y%m%d %H:%M:%S US/Eastern")
+    oca = f"TWAP_{info['symbol']}_{end_et.strftime('%H%M')}"
+    try:
+        twap = Order(
+            action="SELL", totalQuantity=qty, orderType="MKT", tif="DAY",
+            algoStrategy="Twap",
+            algoParams=[TagValue("startTime", ""), TagValue("endTime", end_str),
+                        TagValue("allowPastEndTime", "1"),
+                        TagValue("strategyType", "Marketable")],
+            outsideRth=True, account=acct, orderId=ib.client.getReqId(),
+            ocaGroup=oca, ocaType=3, transmit=True)
+        guard = StopOrder("SELL", qty, round(float(info["stop"]), 2),
+                          orderId=ib.client.getReqId(), tif="GTC", outsideRth=True,
+                          account=acct, ocaGroup=oca, ocaType=3, transmit=True)
+        ib.placeOrder(contract, twap)
+        ib.placeOrder(contract, guard)
+    except Exception:
+        logger.exception("TWAP placement failed for %s — remainder stays on its stop",
+                         info["symbol"])
+        return None
+    # Success: cancel the old remainder stop (the TWAP + reduce-OCO stop replace it).
+    sid = info.get("stop_order_id")
+    if sid:
+        for tr in ib.openTrades():
+            if getattr(tr.order, "orderId", None) == sid:
+                try:
+                    ib.cancelOrder(tr.order)
+                except Exception:
+                    logger.exception("cancel old stop failed %s", info["symbol"])
+    logger.warning("TWAP exit started %s: %d sh until %s (reduce-OCO stop %.2f)",
+                   info["symbol"], qty, end_str, float(info["stop"]))
+    fill_logger.log_event("twap_exit_started", symbol=info["symbol"], shares=qty,
+                          until=end_str, stop=info["stop"])
+    return qty
 
 
 async def attach_trail_on_target_fill(ib: IB, symbol: str, residual_qty: int) -> None:

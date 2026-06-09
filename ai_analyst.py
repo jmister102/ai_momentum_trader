@@ -27,6 +27,7 @@ import config
 
 logger = logging.getLogger("ai_analyst")
 ET = pytz.timezone("America/New_York")
+MAX_TRADES = int(getattr(config, "TRADE_DIVISOR", 8))   # daily trade cap
 PLAYBOOK_PATH = Path(__file__).parent / "playbook.md"
 
 
@@ -91,7 +92,8 @@ HARD RULES YOU MUST FOLLOW (non-negotiable):
       position overnight. Set overnight_hold_pct (0-100) = the % of shares to hold
       past today's close; the rest is sold into the close. Anything carried is
       protected by a GTC stop and force-closed by the NEXT day's 15:55 ET sweep.
-- Max 2 trades per day — if you see "trades_today: 2" you MUST output NO-GO.
+- Respect the daily trade cap shown in Session Context ("Trades taken today: X / N
+  max"). If trades_today has reached the cap (X ≥ N), you MUST output NO-GO.
 
 Respond ONLY with a valid JSON object. No preamble, no explanation outside the JSON.
 Schema:
@@ -143,7 +145,7 @@ classic continuation candidate — judge whether the move is still being support
 (volume, catalyst, orderly trend) versus exhausting (parabolic blow-off, reversal).
 
 ## Session Context
-- Trades taken today: {trades_today} / 2 max
+- Trades taken today: {trades_today} / {max_trades} max
 - Current ET time: {et_time}  ({clock_session})
 - Extended hours: pre-market (04:00–09:30) and post-market (16:00–20:00) entries
   ARE allowed and orders are routed to fill outside regular hours. Liquidity and
@@ -261,6 +263,7 @@ def build_user_prompt(
         chart_path=chart_path or "(chart unavailable)",
         price_vs_entry=price_vs_entry,
         trades_today=trades_today,
+        max_trades=MAX_TRADES,
         et_time=now_et.strftime("%H:%M:%S %Z"),
         clock_session=clock_session(now_et),
         entry_session=("swing-eligible (after 12:00 ET — overnight_hold_pct may be 0-100)"
@@ -339,8 +342,8 @@ def call_ai(
     if now_et is None:
         now_et = datetime.now(ET)
     # Pre-empt the daily limit without spending a token.
-    if trades_today >= 2:
-        return _no_go("trades_today is 2 — daily limit, forced NO-GO")
+    if trades_today >= MAX_TRADES:
+        return _no_go(f"trades_today is {trades_today} — daily limit ({MAX_TRADES}), forced NO-GO")
 
     user_prompt = build_user_prompt(enrichment, chart_path, trades_today, now_et)
 

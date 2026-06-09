@@ -47,11 +47,13 @@ import fill_logger
 logger = logging.getLogger("order_router")
 ET = pytz.timezone("America/New_York")
 
-DOLLAR_SIZE = 200.0
 FORCED_EXIT = dtime(15, 55)
 NOON_ET = dtime(12, 0)
 MIN_MINUTES_TO_ENTER = 30   # intraday only; swing entries have no same-day exit need
 TRAIL_PERCENT = 15.0
+# Per-trade $ size = settled_cash / TRADE_DIVISOR; at most TRADE_DIVISOR trades/day,
+# so total deployment ≤ settled cash (cash account: no trading on unsettled funds).
+MAX_TRADES_PER_DAY = int(getattr(config, "TRADE_DIVISOR", 8))
 
 
 def _is_swing(now_et: datetime) -> bool:
@@ -59,9 +61,9 @@ def _is_swing(now_et: datetime) -> bool:
     return now_et.timetz().replace(tzinfo=None) >= NOON_ET
 
 
-def shares_for(entry_limit: float) -> int:
-    """floor($200 / entry) — the only position-sizing rule. Never more."""
-    return int(math.floor(DOLLAR_SIZE / entry_limit)) if entry_limit > 0 else 0
+def shares_for(entry_limit: float, dollar_size: float) -> int:
+    """floor(dollar_size / entry) — never more. dollar_size = settled_cash/8."""
+    return int(math.floor(dollar_size / entry_limit)) if entry_limit > 0 else 0
 
 
 def _minutes_to_close(now_et: Optional[datetime] = None) -> int:
@@ -76,16 +78,24 @@ def _is_live_account(ib: IB) -> bool:
     return any(a and not a.startswith("DU") for a in ib.managedAccounts())
 
 
+def _acct() -> str:
+    """The configured trading account id ('' = the connection default)."""
+    return getattr(config, "IB_ACCOUNT", "") or ""
+
+
 async def submit_orders(
     ib: IB,
     symbol: str,
     decision: Dict[str, Any],
+    dollar_size: float,
     now_et: Optional[datetime] = None,
     allow_live: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Validate guards, build the bracket, transmit. Returns the logged entry
     record on success, or None if the order was rejected (reason logged).
+
+    dollar_size = settled_cash / TRADE_DIVISOR (the per-trade ceiling).
     """
     if decision.get("decision") != "GO":
         logger.info("not a GO for %s — nothing to submit", symbol)
@@ -97,10 +107,16 @@ async def submit_orders(
                      symbol)
         return None
 
-    # ── daily limit ──
+    if dollar_size <= 0:
+        logger.warning("per-trade size is %.2f (settled cash unknown?) — rejecting %s",
+                       dollar_size, symbol)
+        return None
+
+    # ── daily limit (TRADE_DIVISOR trades/day) ──
     n = fill_logger.trades_today()
-    if n >= 2:
-        logger.warning("Daily trade limit reached (%d) — rejecting %s", n, symbol)
+    if n >= MAX_TRADES_PER_DAY:
+        logger.warning("Daily trade limit reached (%d/%d) — rejecting %s",
+                       n, MAX_TRADES_PER_DAY, symbol)
         return None
 
     if now_et is None:
@@ -123,10 +139,10 @@ async def submit_orders(
         return None
 
     entry = float(decision["entry_limit"])
-    qty = shares_for(entry)
+    qty = shares_for(entry, dollar_size)
     if qty < 1:
-        logger.warning("entry %.2f too high for $%.0f size — 0 shares, skipping %s",
-                       entry, DOLLAR_SIZE, symbol)
+        logger.warning("entry %.2f too high for $%.0f per-trade size — 0 shares, skipping %s",
+                       entry, dollar_size, symbol)
         return None
 
     t1 = float(decision["target_1_price"])
@@ -141,11 +157,12 @@ async def submit_orders(
     await ib.qualifyContractsAsync(contract)
 
     oca_group = f"OCA_{symbol}_{int(_minutes_to_close(now_et))}"
+    acct = getattr(config, "IB_ACCOUNT", "") or ""   # target the configured account
 
     # Parent buy — hold transmit until all children are attached.
     parent = LimitOrder("BUY", qty, round(entry, 2),
                         orderId=ib.client.getReqId(), tif="DAY", transmit=False,
-                        outsideRth=outside_rth)
+                        outsideRth=outside_rth, account=acct)
 
     children: List[Order] = []
 
@@ -153,7 +170,7 @@ async def submit_orders(
     tgt1 = LimitOrder("SELL", qty_t1, round(t1, 2),
                       orderId=ib.client.getReqId(), tif=child_tif,
                       parentId=parent.orderId, ocaGroup=oca_group, ocaType=1,
-                      transmit=False, outsideRth=outside_rth)
+                      transmit=False, outsideRth=outside_rth, account=acct)
     children.append(tgt1)
 
     # Optional target 2 on the residual.
@@ -161,14 +178,14 @@ async def submit_orders(
         tgt2 = LimitOrder("SELL", qty_residual, round(float(t2), 2),
                           orderId=ib.client.getReqId(), tif=child_tif,
                           parentId=parent.orderId, ocaGroup=oca_group, ocaType=1,
-                          transmit=False, outsideRth=outside_rth)
+                          transmit=False, outsideRth=outside_rth, account=acct)
         children.append(tgt2)
 
     # Stop on 100% of shares, OCA — transmit=True on the last child fires the batch.
     stp = StopOrder("SELL", qty, round(stop, 2),
                     orderId=ib.client.getReqId(), tif=child_tif,
                     parentId=parent.orderId, ocaGroup=oca_group, ocaType=1,
-                    transmit=True, outsideRth=outside_rth)
+                    transmit=True, outsideRth=outside_rth, account=acct)
     children.append(stp)
 
     trades = [ib.placeOrder(contract, parent)]
@@ -209,7 +226,7 @@ async def attach_trail_on_target_fill(ib: IB, symbol: str, residual_qty: int) ->
     await ib.qualifyContractsAsync(contract)
     trail = Order(orderType="TRAIL", action="SELL", totalQuantity=residual_qty,
                   trailingPercent=TRAIL_PERCENT, tif="DAY",
-                  orderId=ib.client.getReqId(), transmit=True)
+                  orderId=ib.client.getReqId(), transmit=True, account=_acct())
     ib.placeOrder(contract, trail)
     logger.info("trail attached for %s: %d sh @ %.0f%% offset",
                 symbol, residual_qty, TRAIL_PERCENT)
@@ -231,7 +248,7 @@ def _market_sell(ib: IB, contract, qty: int, real_position: int) -> None:
         logger.warning("%s: selling %d of %d total shares (manual/carry preserved)",
                        contract.symbol, qty, real_position)
     ib.placeOrder(contract, MarketOrder("SELL", qty, tif="DAY",
-                                        orderId=ib.client.getReqId()))
+                                        orderId=ib.client.getReqId(), account=_acct()))
     logger.warning("market-sell %s x%d (forced)", contract.symbol, qty)
 
 
@@ -254,12 +271,13 @@ def _arm_overnight_bracket(ib: IB, contract, qty: int,
     stp = StopOrder("SELL", qty, round(float(stop_price), 2),
                     orderId=ib.client.getReqId(), tif="GTC",
                     ocaGroup=oca, ocaType=1, transmit=(target_price is None),
-                    outsideRth=True)
+                    outsideRth=True, account=_acct())
     ib.placeOrder(contract, stp)
     if target_price:
         tgt = LimitOrder("SELL", qty, round(float(target_price), 2),
                          orderId=ib.client.getReqId(), tif="GTC",
-                         ocaGroup=oca, ocaType=1, transmit=True, outsideRth=True)
+                         ocaGroup=oca, ocaType=1, transmit=True, outsideRth=True,
+                         account=_acct())
         ib.placeOrder(contract, tgt)
 
 
@@ -291,9 +309,12 @@ def forced_exit_sweep(ib: IB, allow_live: bool = False,
         logger.info("forced-exit sweep: no open bot positions — nothing to do")
         return []
 
-    # Index the operator's real LONG STOCK positions by symbol.
+    # Index the configured account's real LONG STOCK positions by symbol.
+    acct = _acct()
     ib_long = {}
     for pos in ib.positions():
+        if acct and getattr(pos, "account", "") != acct:
+            continue
         c = pos.contract
         if getattr(c, "secType", "STK") == "STK" and pos.position > 0:
             ib_long[c.symbol] = pos

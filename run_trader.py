@@ -29,6 +29,7 @@ from typing import Any, Dict
 
 import pytz
 
+import account as account_mod
 import config
 import decision_log
 import fill_logger
@@ -119,6 +120,20 @@ def _account_guard(ib, allow_live: bool, dry_run: bool) -> bool:
       • paper-declared config + live account : unbypassable abort (mismatch).
     """
     accounts = ib.managedAccounts()
+    cfg_acct = getattr(config, "IB_ACCOUNT", "") or ""
+    # With more than one account, the trading account MUST be specified so the bot
+    # can't size/trade the wrong one. Enforced in every mode (dry-run reads settled
+    # cash for sizing too).
+    if len(accounts) > 1 and not cfg_acct:
+        logger.error("⛔ REFUSING TO START: %d accounts %s but IB_ACCOUNT is unset. "
+                     "Run `py account_info.py`, then set IB_ACCOUNT in config.py to "
+                     "the Roth IRA id.", len(accounts), accounts)
+        return False
+    if cfg_acct and cfg_acct not in accounts:
+        logger.error("⛔ IB_ACCOUNT=%s is not one of the managed accounts %s",
+                     cfg_acct, accounts)
+        return False
+
     live_accts = [a for a in accounts if a and not a.startswith("DU")]
     declared_paper = str(config.ACCOUNT_TYPE).lower() != "live"
 
@@ -214,11 +229,13 @@ IB_PREFER_SECONDS = 90
 
 
 class Trader:
-    def __init__(self, ib, dry_run: bool, allow_live: bool, mode: str):
+    def __init__(self, ib, dry_run: bool, allow_live: bool, mode: str,
+                 per_trade_dollars: float = 0.0):
         self.ib = ib
         self.dry_run = dry_run
         self.allow_live = allow_live
         self.mode = mode
+        self.per_trade_dollars = per_trade_dollars  # settled_cash / TRADE_DIVISOR
         self._swept_date = None
         self._last_ib_movers = None   # time.monotonic() of last non-empty IB movers
 
@@ -313,10 +330,12 @@ class Trader:
             order_rec = None
             if decision.get("decision") == "GO" and not self.dry_run:
                 order_rec = await submit_orders(self.ib, symbol, decision,
+                                                self.per_trade_dollars,
                                                 allow_live=self.allow_live)
             elif decision.get("decision") == "GO" and self.dry_run:
-                logger.info("[dry-run] would submit %d sh of %s",
-                            shares_for(decision["entry_limit"]), symbol)
+                logger.info("[dry-run] would submit %d sh of %s (~$%.0f/trade)",
+                            shares_for(decision["entry_limit"], self.per_trade_dollars),
+                            symbol, self.per_trade_dollars)
 
             _print_trigger_block(trig, enrichment, decision, order_rec)
         except Exception:
@@ -344,7 +363,22 @@ async def main_async(args) -> int:
         return 1
 
     mode = "DRY-RUN" if args.dry_run else ("LIVE" if args.allow_live else "PAPER")
-    trader = Trader(ib, dry_run=args.dry_run, allow_live=args.allow_live, mode=mode)
+
+    # Daily sizing baseline: per-trade = settled_cash / TRADE_DIVISOR, fetched once
+    # at startup for the configured account.
+    cfg_acct = config.IB_ACCOUNT or (ib.managedAccounts()[0] if ib.managedAccounts() else "")
+    divisor = int(getattr(config, "TRADE_DIVISOR", 8))
+    settled = await account_mod.settled_cash(ib, cfg_acct)
+    per_trade = (settled / divisor) if settled else 0.0
+    if settled:
+        logger.info("account %s settled cash $%,.2f → per-trade $%,.2f "
+                    "(up to %d trades/day)", cfg_acct, settled, per_trade, divisor)
+    else:
+        logger.warning("could not read settled cash for %s — per-trade size $0 "
+                       "(live orders rejected; dry-run analysis unaffected)", cfg_acct)
+
+    trader = Trader(ib, dry_run=args.dry_run, allow_live=args.allow_live, mode=mode,
+                    per_trade_dollars=per_trade)
 
     dash = None if args.no_dashboard else _start_dashboard(args.dashboard_host,
                                                            args.dashboard_port)

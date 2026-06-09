@@ -26,6 +26,7 @@ from typing import Awaitable, Callable, List, Optional
 import requests
 
 import config
+import triggered
 from trigger_monitor import Trigger, session_now
 
 logger = logging.getLogger("pm_scanner")
@@ -150,7 +151,8 @@ class PolygonPMScanner:
         key = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
         if key != self._day_key:
             self._day_key = key
-            self.triggered_today.clear()
+            # Persistent debounce shared with the IB scanner (survives restarts).
+            self.triggered_today = triggered.symbols_today()
 
     async def scan_once(self, verbose: bool = False) -> List[Trigger]:
         self._roll_day()
@@ -165,6 +167,10 @@ class PolygonPMScanner:
             if trig.symbol in self.triggered_today:
                 continue
             self.triggered_today.add(trig.symbol)
+            # Persist so the debounce survives restarts and the IB scanner sees it.
+            triggered.record(trig.symbol, {"pct_gain": round(trig.pct_gain, 4),
+                                           "scanner": "polygon_pm",
+                                           "session": trig.session})
             fired.append(trig)
             if self.on_trigger:
                 res = self.on_trigger(trig)

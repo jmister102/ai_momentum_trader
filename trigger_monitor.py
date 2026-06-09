@@ -46,6 +46,7 @@ except ImportError:
     IB = ScannerSubscription = Ticker = object  # type: ignore[assignment,misc]
 
 import config
+import triggered
 
 ET = pytz.timezone("America/New_York")
 TRIGGERS_PATH = Path(__file__).parent / "triggers.jsonl"
@@ -189,12 +190,14 @@ class TriggerMonitor:
         )
 
     def _roll_day(self) -> None:
-        """Clear the debounce set at the start of a new ET day."""
+        """Load today's already-triggered symbols from disk (persistent debounce —
+        survives restarts and spans both scanners) at the start of each ET day."""
         key = datetime.now(ET).strftime("%Y-%m-%d")
         if key != self._day_key:
             self._day_key = key
-            self.triggered_today.clear()
-            logger.info("new ET day %s — debounce cleared", key)
+            self.triggered_today = triggered.symbols_today()
+            logger.info("ET day %s — %d symbol(s) already triggered today; "
+                        "they will be skipped", key, len(self.triggered_today))
 
     async def _current_rows(self, diagnose: bool = False) -> list:
         """Read the latest rows from a PERSISTENT scanner subscription. Subscribes

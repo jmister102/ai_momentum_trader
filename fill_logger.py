@@ -80,15 +80,22 @@ def _et_date(ts: str) -> Optional[str]:
 
 
 def trades_today(path: Path = FILLS_PATH, now: Optional[datetime] = None) -> int:
-    """Count entry events whose ET date == today. Drives the 2-trade/day guard."""
+    """Net entries today (submitted minus rejected/cancelled-without-fill) — drives
+    the daily trade guard. A rejected order (e.g. a closing-only symbol) never
+    opened a position, so it doesn't burn a trade slot."""
     if now is None:
         now = datetime.now(ET)
     today = now.astimezone(ET).strftime("%Y-%m-%d")
-    count = 0
+    entries = rejects = 0
     for rec in read_all(path):
-        if rec.get("event") in ENTRY_EVENTS and _et_date(rec.get("ts", "")) == today:
-            count += 1
-    return count
+        if _et_date(rec.get("ts", "")) != today:
+            continue
+        ev = rec.get("event")
+        if ev in ENTRY_EVENTS:
+            entries += 1
+        elif ev == "entry_rejected":
+            rejects += 1
+    return max(0, entries - rejects)
 
 
 def symbols_entered_today(path: Path = FILLS_PATH,

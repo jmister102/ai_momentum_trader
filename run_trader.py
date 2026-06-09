@@ -246,6 +246,7 @@ class Trader:
         self._last_triggered: list = []
         self._order_state: Dict[int, tuple] = {}   # orderId → last (status, filled, remaining)
         self._order_errors: Dict[int, str] = {}     # orderId → IB reject reason
+        self._rejected_logged: set = set()          # orderIds already logged as entry_rejected
 
     def _account_long(self) -> Dict[str, int]:
         """Configured account's long STOCK positions {symbol: shares}."""
@@ -380,6 +381,18 @@ class Trader:
                         c.symbol, o.action, o.orderType, o.totalQuantity, lmt,
                         st.status, st.filled, o.totalQuantity,
                         f"{st.avgFillPrice:.4f}" if st.avgFillPrice else "-")
+
+            # A bot ENTRY (BUY) that terminated without filling (e.g. a closing-only
+            # symbol) never opened a position → don't count it toward the daily cap.
+            if (o.action == "BUY" and st.filled == 0
+                    and st.status in ("Cancelled", "Inactive", "ApiCancelled")
+                    and o.orderId not in self._rejected_logged):
+                self._rejected_logged.add(o.orderId)
+                fill_logger.log_event("entry_rejected", symbol=c.symbol,
+                                      order_id=o.orderId,
+                                      reason=self._order_errors.get(o.orderId))
+                logger.info("entry %s rejected/cancelled without fill — daily trade "
+                            "slot freed", c.symbol)
             self._write_status()
         except Exception:
             logger.exception("order event handler failed")

@@ -245,6 +245,7 @@ class Trader:
         self._last_poll = None
         self._last_triggered: list = []
         self._order_state: Dict[int, tuple] = {}   # orderId → last (status, filled, remaining)
+        self._order_errors: Dict[int, str] = {}     # orderId → IB reject reason
 
     def _account_long(self) -> Dict[str, int]:
         """Configured account's long STOCK positions {symbol: shares}."""
@@ -278,6 +279,7 @@ class Trader:
                 "filled": st.filled, "remaining": st.remaining,
                 "avg_fill": round(st.avgFillPrice, 4) if st.avgFillPrice else None,
                 "status": st.status,
+                "reason": self._order_errors.get(o.orderId),   # IB reject reason if any
             })
         return rows[-25:]
 
@@ -341,6 +343,27 @@ class Trader:
             })
         except Exception:
             logger.exception("status write failed")
+
+    # IB status/notification codes that are benign farm/connection chatter, not
+    # order problems — don't surface these as errors.
+    _BENIGN_IB_CODES = {1100, 1101, 1102, 2100, 2103, 2104, 2105, 2106, 2107,
+                        2108, 2119, 2150, 2158, 2168, 2169}
+
+    def on_ib_error(self, reqId, errorCode, errorString, contract=None) -> None:
+        """Log IB errors and capture per-order reject reasons (so 'Inactive'
+        orders show WHY in the log and on the dashboard)."""
+        try:
+            if errorCode in self._BENIGN_IB_CODES:
+                return
+            sym = getattr(contract, "symbol", None)
+            logger.warning("IB error %s%s: %s", errorCode,
+                           f" [{sym}]" if sym else (f" reqId={reqId}" if reqId and reqId > 0 else ""),
+                           errorString)
+            if reqId and reqId > 0:   # reqId == orderId for order errors
+                self._order_errors[reqId] = f"{errorCode}: {errorString}"
+                self._write_status()
+        except Exception:
+            logger.exception("ib error handler failed")
 
     def on_order_event(self, trade) -> None:
         """IB order/fill event → log the change to the log file and refresh the
@@ -444,6 +467,7 @@ async def main_async(args) -> int:
     # Live order/fill events → log + dashboard refresh (orders show even unfilled).
     ib.orderStatusEvent += trader.on_order_event
     ib.openOrderEvent += trader.on_order_event
+    ib.errorEvent += trader.on_ib_error   # capture reject reasons (e.g. Inactive)
 
     dash = None if args.no_dashboard else _start_dashboard(args.dashboard_host,
                                                            args.dashboard_port)

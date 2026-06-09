@@ -97,7 +97,7 @@ async function tick(){
      return '<tr><td><b>'+o.symbol+'</b></td><td>'+(o.action||'')+'</td><td>'+(o.type||'')+
        '</td><td class="num">'+(o.limit!=null?o.limit:'—')+'</td><td class="num">'+(o.qty!=null?o.qty:'—')+
        '</td><td class="num '+fillcls+'">'+(o.filled!=null?o.filled:0)+'</td><td class="num">'+(o.avg_fill!=null?o.avg_fill:'—')+
-       '</td><td>'+(o.status||'')+'</td></tr>';
+       '</td><td>'+(o.status||'')+(o.reason?(' <span class="held" title="'+String(o.reason).replace(/"/g,"&quot;")+'">⚠ '+o.reason+'</span>'):'')+'</td></tr>';
    }).join(''); }
   else { od.innerHTML='<tr><td colspan="8" class="muted">no orders yet</td></tr>'; }
   const tg=document.getElementById('trig');
